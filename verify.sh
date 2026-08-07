@@ -104,7 +104,22 @@ if [[ -f "$HOME/.cursor/mcp.json" ]]; then
   fi
 fi
 
-# 6. Skills are discoverable.
+# 6. Stealth tooling is present and parses. Deliberately not exercised: a real
+#    run launches a second Chrome on 9334, which is on-demand by design.
+if command -v stealth-cdp >/dev/null 2>&1 && stealth-cdp --help >/dev/null 2>&1; then
+  pass "stealth-cdp installed (bot-safe Chrome, port ${STEALTH_CHROME_PORT:-9334})"
+else
+  fail "stealth-cdp missing or not runnable"
+fi
+for t in gd-cookies.mjs kasada-ab-test.mjs; do
+  if [[ -f "$RUNTIME_DIR/$t" ]] && node --check "$RUNTIME_DIR/$t" 2>/dev/null; then
+    pass "$t installed"
+  else
+    fail "$RUNTIME_DIR/$t missing or has a syntax error"
+  fi
+done
+
+# 7. Skills are discoverable.
 for d in "$HOME/.claude/skills/automation-chrome/SKILL.md" "$HOME/.cursor/skills/automation-chrome/SKILL.md"; do
   [[ -f "$d" ]] && pass "skill installed: ~/${d#"$HOME"/}"
 done

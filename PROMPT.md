@@ -15,10 +15,10 @@ Everything you need is in this private repo:
     https://github.com/vicks1008/automation-chrome
 
 It contains the launcher and health/reset scripts, the LaunchAgent, the MCP
-wrapper with a pinned `chrome-devtools-mcp`, the `automation-chrome` skill, an
-idempotent `install.sh`, and a `verify.sh` that proves the result actually
-works. The README explains why each piece is shaped the way it is. Read it
-before you change anything.
+wrapper with a pinned `chrome-devtools-mcp`, the `automation-chrome` skill, the
+`stealth-cdp` driver and bot-detection tools, an idempotent `install.sh`, and a
+`verify.sh` that proves the result actually works. The README explains why each
+piece is shaped the way it is. Read it before you change anything.
 
 ## How to work
 
@@ -72,6 +72,14 @@ fix the failure without breaking them:
   flag set, re-verify the tool count.
 - Do not point the MCP at my everyday Chrome profile, do not weaken the
   profile's isolation, and do not remove the launchd `KeepAlive` throttle.
+- **The stealth browser stays a separate browser.** `stealth-cdp` exists because
+  puppeteer's `Runtime.enable` is directly detectable by bot-management vendors,
+  and a URL exclude filter alone is not airtight — a tab is briefly
+  `about:blank` between creation and navigation, and puppeteer can attach in
+  that window. Do not "simplify" it onto port 9333, and do not add
+  `Runtime.enable` to it. It is on-demand and correctly needs no LaunchAgent:
+  it spawns `detached`, which makes it a process-group leader via `setsid`,
+  unlike the main launcher's `nohup`.
 
 ## Phase 2 — prove it actually works
 

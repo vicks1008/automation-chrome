@@ -48,6 +48,11 @@ Pointing `chrome-devtools-mcp` at your main Chrome creates a flaky loop:
 │          ├─ spawns ─► chrome-devtools-mcp-filtered.mjs ────────────┘
 │  Claude ─┘             (wrapper: target filtering + logging)       │
 │                        --browserUrl http://127.0.0.1:9333          │
+│                                                                    │
+│  stealth-cdp ─── spawns on demand ──►  Google Chrome               │
+│  (raw CDP, no Runtime.enable)          --user-data-dir=CursorStealth
+│                                        --remote-debugging-port=9334│
+│                                        (invisible to the MCP)      │
 └────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -63,12 +68,17 @@ Separate ports mean the MCP only ever talks to the clean profile.
 | `~/.local/bin/automation-chrome-health` | Verifies port 9333, `/json/version`, target count, MCP processes. |
 | `~/.local/bin/automation-chrome-reset` | Kills wedged MCPs and restarts Chrome through launchd. |
 | `~/.local/bin/automation-chrome-sync-cookies` | Hot-copies Cookies + Local Storage from the main profile. **Not for bot-managed sites** — see below. |
+| `~/.local/bin/stealth-cdp` | Drives a page over raw CDP without `Runtime.enable`, in its own Chrome on port 9334. For bot-protected sites. |
 | `~/Library/LaunchAgents/com.local.automation-chrome.plist` | Starts at login, restarts on crash (not on clean quit). |
 | `~/.automation-chrome/` | Runtime dir: MCP wrapper, pinned `node_modules`, logs, resolved flag set. |
 | `~/.automation-chrome/chrome-devtools-mcp-filtered.mjs` | Wrapper that monkey-patches `puppeteer.connect` for target filtering. |
 | `~/.automation-chrome/mcp-args.json` | The resolved MCP flag set. Written by the installer; read by `verify.sh`. |
 | `~/.automation-chrome/probe-mcp.mjs` | Boots the MCP with a candidate flag set and reports the tool surface. |
+| `~/.automation-chrome/gd-cookies.mjs` | Lists/clears bot-management cookies and storage for a domain, over CDP. |
+| `~/.automation-chrome/kasada-ab-test.mjs` | A/B harness: measures which CDP domains trip a site's bot detection. |
+| `~/.automation-chrome/stealth-target.json` | Which tab `stealth-cdp` is currently driving. |
 | `~/Library/Application Support/Google/Chrome/CursorAutomation/` | The dedicated profile. Created on first launch; logins persist. |
+| `~/Library/Application Support/Google/Chrome/CursorStealth/` | Profile for the stealth Chrome (port 9334). Logins persist here too. |
 | `~/.claude/skills/automation-chrome/`, `~/.cursor/skills/automation-chrome/` | The skill, so agents know how to operate this. |
 
 The profile keeps the name `CursorAutomation` even on a Claude-only machine:
@@ -84,6 +94,7 @@ Look for the Chrome window whose profile pill reads `CursorAutomation`.
 automation-chrome-health         # is everything alive?
 automation-chrome-reset          # kill wedged MCP + restart Chrome if down
 automation-chrome-sync-cookies   # re-pull sessions from main Chrome
+stealth-cdp status               # is the bot-safe Chrome (9334) up, what tab?
 ./verify.sh                      # full end-to-end check incl. MCP tool count
 ```
 
@@ -158,24 +169,109 @@ Kasada-protected login, identical profile/machine/IP:
 | `Runtime.evaluate` (no enable) | 200 OK |
 | **`Runtime.enable`** | **429 blocked** |
 
-Mitigation: keep the MCP away from those origins. Set
-`CDM_EXCLUDE_URL_PATTERNS` (comma-separated substrings) in the MCP env and the
-wrapper's `targetFilter` rejects them before Puppeteer can attach. Confirm it is
-live by looking for `[cdm-wrapper] EXCLUDE https://...` in the MCP stderr, which
-needs `CDM_PATCH_LOG=1` (the installer sets it).
+Reproduce it on any Kasada-protected login:
 
-A URL exclude alone is not airtight — a tab is briefly `about:blank` between
-creation and navigation, and Puppeteer can attach during that window. Driving
-such sites properly needs a second Chrome on its own port speaking raw CDP with
-`Runtime.evaluate` instead of `Runtime.enable`. That companion tool is not part
-of this bundle.
+```bash
+node ~/.automation-chrome/kasada-ab-test.mjs --username=you@example.com --variant=clean    # expect 200
+node ~/.automation-chrome/kasada-ab-test.mjs --username=you@example.com --variant=runtime  # expect 429
+```
+
+### Two mitigations, applied together
+
+**1. The MCP never attaches to hostile origins.** Set
+`CDM_EXCLUDE_URL_PATTERNS` (comma-separated substrings) in the MCP env and the
+wrapper's `targetFilter` rejects those targets before Puppeteer can attach.
+Confirm it is live by looking for `[cdm-wrapper] EXCLUDE https://...` in the MCP
+stderr, which needs `CDM_PATCH_LOG=1` (the installer sets it). To add origins:
+
+```bash
+claude mcp remove chrome-devtools --scope user
+claude mcp add chrome-devtools --scope user \
+  -e CDM_PATCH_LOG=1 -e CDM_EXCLUDE_URL_PATTERNS=godaddy.com,example.com \
+  -- node $(node -p 'JSON.parse(require("fs").readFileSync(process.env.HOME+"/.automation-chrome/mcp-args.json","utf8")).join(" ")')
+```
+
+For Cursor, add the same key to `env` in `~/.cursor/mcp.json`.
+
+**2. `stealth-cdp` drives those sites instead.** It speaks raw CDP and uses
+`Runtime.evaluate` — a one-shot command that does *not* flip the debugger
+switch — plus real `Input.*` events. It runs its own Chrome on **port 9334**
+with its own persistent profile, so the MCP on 9333 cannot see it at all.
+
+A URL exclude alone is not airtight: a tab is briefly `about:blank` between
+creation and navigation, and Puppeteer can attach during that window and enable
+Runtime before the filter has a URL to match. Separate browsers is the only
+airtight answer.
+
+```bash
+stealth-cdp status                                   # is it up, which tab
+stealth-cdp open "https://sso.godaddy.com/"
+stealth-cdp type '#username' 'you@example.com'
+stealth-cdp type '#password' --stdin < ~/.secrets/gd # keeps it out of argv
+stealth-cdp click 'button[type=submit]'
+stealth-cdp clicktext 'Add New Record'               # click by visible label
+stealth-cdp clickxy 640 380                          # reaches cross-origin iframes
+stealth-cdp typefocused 'text'                       # for iframe fields
+stealth-cdp net idp                                  # status codes, no Network domain
+stealth-cdp shot /tmp/out.png
+stealth-cdp focus                                    # raise the window to log in by hand
+```
+
+The stealth Chrome does not need launchd. It is spawned with `detached: true`,
+which makes it a process-group leader via `setsid`, so tearing down the calling
+shell's process group does not reach it. The main launcher's `nohup` only
+ignores SIGHUP and cannot survive that — which is exactly why *it* is given to
+launchd instead.
+
+`stealth-cdp` has no `Runtime.enable`, so there is no console-message stream and
+no network event stream. `net` reads `performance.getEntriesByType('resource')`,
+which exposes `responseStatus` without enabling the Network domain.
+
+### Click by label, do not tag the DOM
+
+`clicktext` exists to replace this idiom, which was the default way to reach a
+control with no stable selector:
+
+```bash
+# DON'T: mutates the page
+stealth-cdp eval "(()=>{const b=[...document.querySelectorAll('button')].find(x=>/^Save$/i.test(x.innerText));b.id='sc-x';return 'ok'})()"
+stealth-cdp click '#sc-x'
+```
+
+An injected `id` is **not inert**. SPA routers, tab strips, `label[for]` pairs
+and anchor targets all read `id`. Setting `id="sc-dnstab"` on a GoDaddy tab
+button made its router treat the injected value as the tab key, navigate to
+`?tab=sc-dnstab`, and render an empty table — which reads as "the page is
+broken", not "the tool broke the page". Use `data-*` if you must tag something;
+prefer not tagging at all.
+
+```bash
+stealth-cdp clicktext 'Save'                       # innerText or aria-label
+stealth-cdp clicktext 'Delete' --scope='tbody tr'  # narrow the search root
+stealth-cdp clicktext 'DNS' --nth=1                # disambiguate; count is printed
+stealth-cdp clicktext 'Add New' --contains         # substring
+```
+
+It matches `aria-label` as well as text, so icon-only row buttons are reachable
+by accessible name, skips hidden elements, and resolves to the **innermost**
+match — a wrapper inherits its child's `innerText`, and clicking the wrapper
+often misses the real handler. When more than one element matches it prints the
+count, so ambiguity is visible instead of silently resolving to the first hit.
 
 **Do not sync cookies into a bot-protected site.** Akamai/Kasada/DataDome
 cookies (`_abck`, `bm_*`, `ak_bmsc`, `reese84`, `datadome`) are bound to the
 fingerprint of the browser that minted them, so replaying them from another
 instance looks exactly like cookie theft and actively causes blocks. An `_abck`
 whose second `~`-delimited field is `0` rather than `-1` is already marked bad.
-Log in inside the automation window instead.
+Log in inside the automation window instead. To inspect or reset them:
+
+```bash
+node ~/.automation-chrome/gd-cookies.mjs list  godaddy   # flags [BOT-MGMT] entries
+node ~/.automation-chrome/gd-cookies.mjs clear godaddy   # cookies + local storage + IDB
+```
+
+Despite the name it takes any domain substring, and
+`AUTOMATION_CHROME_DEBUG_PORT=9334` points it at the stealth Chrome instead.
 
 **Do not inject `id` attributes to find elements.** An injected `id` is not
 inert: SPA routers, tab strips, `label[for]` pairs and anchor targets all read
@@ -230,9 +326,17 @@ non-zero, `KeepAlive.Crashed=true` restarts it.
 **Port 9333 collides with another tool.** Re-run `./install.sh --port 9444`,
 which updates the agent and both client configs together.
 
+**A site says "your browser is unusual" / "enable JavaScript" / "disable your
+VPN".** That is bot management, not a real browser problem. Confirm by checking
+whether the site's auth XHRs return 429, then drive it with `stealth-cdp`
+instead of the MCP and add the origin to `CDM_EXCLUDE_URL_PATTERNS`. If the site
+was working before, clear its bot cookies first with `gd-cookies.mjs clear`.
+
 **A page suddenly returns empty lists / no rows.** Check the URL before
 debugging selectors. Expired sessions usually redirect to a login page that
-still parses fine, so queries return `[]` rather than an error.
+still parses fine, so queries return `[]` rather than an error. The stealth
+profile's sessions expire (typically overnight); run `stealth-cdp url` first,
+and `stealth-cdp focus` to raise the window and log back in.
 
 **Do not conclude a host is down from a failed connection.** Outbound port 25 is
 blocked on most consumer networks, and CDN challenge pages return 403 to any

@@ -52,6 +52,35 @@ behind, so treat the port as the only real evidence.
   `automation-chrome-sync-cookies` copies sessions over, but avoid it for sites
   behind bot management.
 
+## Bot-protected sites need the other browser
+
+A modal saying the browser is "unusual", or asking you to enable JavaScript or
+disconnect a VPN, over a 429 on the site's auth XHR, is bot management — not a
+real browser problem. The trigger is `Runtime.enable`, which puppeteer (and so
+this MCP) calls on every frame it attaches to; it switches the renderer into
+"a debugger is listening" mode, which the page can observe directly.
+
+Do not try to work around it with the MCP. Use `stealth-cdp`, which speaks raw
+CDP with `Runtime.evaluate` instead and runs its own Chrome on port 9334 where
+the MCP cannot see it:
+
+```bash
+stealth-cdp status
+stealth-cdp open "https://example.com/login"
+stealth-cdp type '#password' --stdin < ~/.secrets/x   # keeps secrets out of argv
+stealth-cdp clicktext 'Sign in'
+stealth-cdp net auth                                  # status codes
+```
+
+Prefer `clicktext` over tagging an element and clicking the tag. An injected
+`id` is not inert — SPA routers and `label[for]` pairs read it, and setting one
+has silently broken page state before.
+
+If the site worked previously, clear its bot cookies before retrying:
+`node ~/.automation-chrome/gd-cookies.mjs clear <domain>`. Never sync cookies
+into these sites; the cookies are fingerprint-bound and replaying them reads as
+theft.
+
 ## Helper processes die the same way
 
 Anything started to run alongside the browser — CDP watchers, tunnels, pollers

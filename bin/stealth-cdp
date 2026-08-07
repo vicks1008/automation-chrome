@@ -1,0 +1,577 @@
+#!/usr/bin/env node
+/**
+ * stealth-cdp — drive a page over CDP without tripping commercial bot
+ * detection.
+ *
+ * WHY THIS EXISTS
+ * ---------------
+ * chrome-devtools-mcp drives Chrome through puppeteer, and puppeteer calls
+ * `Runtime.enable` on every frame it attaches to. `Runtime.enable` switches the
+ * renderer into "a debugger is listening" mode, which is observable from inside
+ * the page. Kasada (GoDaddy SSO), and other bot-management vendors, treat it as
+ * a hard automation signal.
+ *
+ * Measured against `POST /v1/api/idp/user/checkusername` on sso.godaddy.com,
+ * with an identical profile, machine and IP:
+ *
+ *     Page.enable only .................. 200  OK
+ *     + Network.enable .................. 200  OK
+ *     + Log.enable ...................... 200  OK
+ *     + DOM.enable ...................... 200  OK
+ *     + Runtime.evaluate (no enable) .... 200  OK
+ *     + Runtime.enable .................. 429  BLOCKED
+ *
+ * So this driver uses `Runtime.evaluate` (a one-shot command) and real
+ * `Input.*` events, and never issues `Runtime.enable`. That keeps arbitrary
+ * JavaScript evaluation, DOM queries and synthetic input available while
+ * staying invisible to the check that matters.
+ *
+ * ISOLATION
+ * ---------
+ * For the above to hold, chrome-devtools-mcp must never attach to the tab. A
+ * URL-based exclude filter is not sufficient on its own, because a tab is
+ * briefly `about:blank` between creation and navigation -- puppeteer can attach
+ * during that window and enable Runtime before the filter has a URL to match.
+ *
+ * So this driver runs its own Chrome on a separate port (9334) with its own
+ * profile. The MCP is pointed at 9333 and cannot see it. The profile persists,
+ * so logins survive across runs. `CDM_EXCLUDE_URL_PATTERNS` in the MCP's env
+ * (see ~/.cursor/mcp.json or `claude mcp get chrome-devtools`) is
+ * belt-and-braces for the case where a hostile URL is opened in the main
+ * automation Chrome by accident.
+ *
+ * Unlike the main automation Chrome, this one does not need launchd. It is
+ * spawned with `detached: true`, which makes it a process-group leader via
+ * setsid, so tearing down the calling shell's process group does not reach it.
+ * `nohup` in the main launcher only ignores SIGHUP and cannot survive that —
+ * which is exactly why that one is given to launchd instead.
+ *
+ * USAGE
+ *   stealth-cdp status                  Show browser state and current tab
+ *   stealth-cdp focus                   Raise the stealth tab (to type by hand)
+ *   stealth-cdp open <url>              Create/reuse the stealth tab, navigate
+ *   stealth-cdp url                     Print the current URL
+ *   stealth-cdp text [selector]         innerText of body (or selector)
+ *   stealth-cdp html [selector]         outerHTML (truncated to 20k)
+ *   stealth-cdp eval '<expression>'     Runtime.evaluate, JSON result
+ *   stealth-cdp click <selector>        Real mouse click at element centre
+ *   stealth-cdp clicktext <text>        Click by visible label / aria-label.
+ *                                       Never mutates the DOM -- prefer this
+ *                                       over tagging an element then clicking
+ *                                       it. Flags: --nth=N (disambiguate),
+ *                                       --scope=<css>, --contains, --any
+ *   stealth-cdp clickxy <x> <y>         Real mouse click at viewport coordinates
+ *                                       (reaches cross-origin iframes)
+ *   stealth-cdp typefocused <text>      Type into the focused element, no selector
+ *                                       (for cross-origin iframe fields)
+ *   stealth-cdp type <selector> <text>  Click to focus, then real key events
+ *   stealth-cdp type <selector> --stdin Same, but read the value from stdin
+ *                                       (keeps secrets out of argv and logs)
+ *   stealth-cdp key <Key>               Press a single key (Enter, Tab, ...)
+ *   stealth-cdp wait <selector> [ms]    Poll until the selector matches
+ *   stealth-cdp shot [path]             PNG screenshot
+ *   stealth-cdp net [substring]         Resource timings + HTTP status codes
+ *   stealth-cdp close                   Close the stealth tab
+ *
+ * ENV
+ *   STEALTH_CHROME_PORT     CDP port for the stealth browser (default 9334)
+ *   STEALTH_CHROME_PROFILE  Profile directory for the stealth browser
+ *   AUTOMATION_CHROME_HOME  Runtime dir for state/screenshots
+ *                           (default ~/.automation-chrome)
+ */
+
+import { spawn } from 'node:child_process';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+
+const PORT = Number(process.env.STEALTH_CHROME_PORT || 9334);
+const CHROME_BIN = '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
+const PROFILE_DIR =
+  process.env.STEALTH_CHROME_PROFILE ||
+  path.join(os.homedir(), 'Library', 'Application Support', 'Google', 'Chrome', 'CursorStealth');
+const RUNTIME_DIR =
+  process.env.AUTOMATION_CHROME_HOME || path.join(os.homedir(), '.automation-chrome');
+const STATE_FILE = path.join(RUNTIME_DIR, 'stealth-target.json');
+
+const [cmd, ...args] = process.argv.slice(2);
+if (!cmd || cmd === '-h' || cmd === '--help') {
+  const source = fs.readFileSync(new URL(import.meta.url), 'utf8');
+  const usage = source.slice(source.indexOf(' * USAGE'), source.indexOf(' */'));
+  console.log(usage.replace(/^ \* ?/gm, ''));
+  process.exit(0);
+}
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const die = (msg) => {
+  console.error(`stealth-cdp: ${msg}`);
+  process.exit(1);
+};
+
+/* ------------------------------------------------------------------ *
+ * Minimal CDP client (flat sessions)
+ * ------------------------------------------------------------------ */
+
+let ws;
+let msgId = 0;
+const pending = new Map();
+
+async function cdpVersion() {
+  try {
+    const res = await fetch(`http://127.0.0.1:${PORT}/json/version`);
+    return res.ok ? await res.json() : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Launch the stealth browser if it is not already up. Flags are kept close to
+ * a default Chrome launch on purpose: every extra switch is one more thing a
+ * fingerprinter can notice, and none of the automation-convenience flags are
+ * needed here.
+ */
+async function ensureBrowser() {
+  if (await cdpVersion()) return;
+  fs.mkdirSync(PROFILE_DIR, { recursive: true });
+  const child = spawn(
+    CHROME_BIN,
+    [
+      `--user-data-dir=${PROFILE_DIR}`,
+      `--remote-debugging-port=${PORT}`,
+      '--no-first-run',
+      '--no-default-browser-check',
+      '--hide-crash-restore-bubble',
+      '--disable-session-crashed-bubble',
+      'about:blank',
+    ],
+    { detached: true, stdio: 'ignore' },
+  );
+  child.unref();
+  for (let i = 0; i < 40; i++) {
+    await sleep(500);
+    if (await cdpVersion()) return;
+  }
+  die(`stealth Chrome did not come up on port ${PORT}`);
+}
+
+async function connect() {
+  await ensureBrowser();
+  const version = await cdpVersion();
+  if (!version) die(`no CDP endpoint on port ${PORT}`);
+  ws = new WebSocket(version.webSocketDebuggerUrl);
+  await new Promise((res, rej) => {
+    ws.addEventListener('open', res, { once: true });
+    ws.addEventListener('error', () => rej(new Error('websocket failed')), { once: true });
+  });
+  ws.addEventListener('message', (ev) => {
+    const m = JSON.parse(ev.data);
+    const p = pending.get(m.id);
+    if (!p) return;
+    pending.delete(m.id);
+    m.error ? p.reject(new Error(m.error.message || JSON.stringify(m.error))) : p.resolve(m.result);
+  });
+}
+
+function send(method, params = {}, sessionId) {
+  const id = ++msgId;
+  const payload = { id, method, params };
+  if (sessionId) payload.sessionId = sessionId;
+  ws.send(JSON.stringify(payload));
+  return new Promise((resolve, reject) => {
+    pending.set(id, { resolve, reject });
+    setTimeout(() => {
+      if (pending.delete(id)) reject(new Error(`${method} timed out`));
+    }, 30000);
+  });
+}
+
+/* ------------------------------------------------------------------ *
+ * Stealth tab lifecycle
+ * ------------------------------------------------------------------ */
+
+function readState() {
+  try {
+    return JSON.parse(fs.readFileSync(STATE_FILE, 'utf8'));
+  } catch {
+    return {};
+  }
+}
+
+function writeState(state) {
+  fs.mkdirSync(path.dirname(STATE_FILE), { recursive: true });
+  fs.writeFileSync(STATE_FILE, JSON.stringify(state, null, 2));
+}
+
+async function liveTargets() {
+  const { targetInfos } = await send('Target.getTargets');
+  return targetInfos.filter((t) => t.type === 'page');
+}
+
+async function resolveTarget({ createUrl } = {}) {
+  const pages = await liveTargets();
+  const saved = readState().targetId;
+  let targetId = pages.find((p) => p.targetId === saved)?.targetId;
+
+  if (!targetId) {
+    if (!createUrl) die('no stealth tab open. Run `stealth-cdp open <url>` first.');
+    ({ targetId } = await send('Target.createTarget', { url: createUrl }));
+    writeState({ targetId, createdAt: new Date().toISOString() });
+    await sleep(500);
+  }
+
+  const { sessionId } = await send('Target.attachToTarget', { targetId, flatten: true });
+  // Page is safe; Runtime is deliberately never enabled.
+  await send('Page.enable', {}, sessionId).catch(() => {});
+  return { targetId, sessionId };
+}
+
+/** Runtime.evaluate WITHOUT Runtime.enable. This is the whole point. */
+async function evaluate(sessionId, expression, { awaitPromise = true } = {}) {
+  const res = await send(
+    'Runtime.evaluate',
+    { expression, returnByValue: true, awaitPromise, userGesture: true },
+    sessionId,
+  );
+  if (res.exceptionDetails) {
+    throw new Error(res.exceptionDetails.exception?.description || 'evaluate threw');
+  }
+  return res.result.value;
+}
+
+const jsString = (s) => JSON.stringify(String(s));
+
+async function boxOf(sessionId, selector) {
+  const box = await evaluate(
+    sessionId,
+    `(() => {
+      const el = document.querySelector(${jsString(selector)});
+      if (!el) return null;
+      el.scrollIntoView({ block: 'center', inline: 'center' });
+      const r = el.getBoundingClientRect();
+      if (r.width === 0 && r.height === 0) return null;
+      return { x: r.left + r.width / 2, y: r.top + r.height / 2 };
+    })()`,
+  );
+  if (!box) die(`selector not found or not visible: ${selector}`);
+  return box;
+}
+
+/**
+ * Locate a visible element by its visible label and return its centre.
+ *
+ * Exists so callers never have to tag an element before clicking it. The
+ * tag-then-click idiom (`el.id = 'sc-x'` followed by `click '#sc-x'`) mutates
+ * the page, and an injected `id` is not inert: SPA routers, tab strips and
+ * label/for pairs all read `id`. Setting one on a GoDaddy tab button made its
+ * router treat the injected value as the tab key and navigate to
+ * `?tab=sc-dnstab`, silently rendering an empty table. Resolving coordinates
+ * read-only avoids the entire failure mode.
+ *
+ * Matches innerText or aria-label, so icon-only controls (table row Edit /
+ * Delete buttons) are reachable by their accessible name.
+ */
+async function boxOfText(sessionId, text, { nth = 0, scope, contains = false, any = false } = {}) {
+  const candidates = any
+    ? '*'
+    : 'button, a, [role=button], [role=tab], [role=menuitem], [role=option], label, summary, input[type=submit], input[type=button]';
+  const found = await evaluate(
+    sessionId,
+    `(() => {
+      const root = ${scope ? `document.querySelector(${jsString(scope)})` : 'document'};
+      if (!root) return { error: 'scope not found' };
+      const want = ${jsString(text)}.trim().toLowerCase();
+      const label = (el) =>
+        ((el.getAttribute && el.getAttribute('aria-label')) || el.innerText || el.value || '')
+          .replace(/\\s+/g, ' ')
+          .trim();
+      let hits = [...root.querySelectorAll(${jsString(candidates)})].filter((el) => {
+        if (el.offsetParent === null && el.tagName !== 'BODY') return false;
+        const r = el.getBoundingClientRect();
+        if (r.width === 0 || r.height === 0) return false;
+        const t = label(el).toLowerCase();
+        return ${contains ? 't.includes(want)' : 't === want'};
+      });
+      // Prefer the innermost match: a wrapper inherits its child's innerText,
+      // and clicking the wrapper can miss the real handler or hit a sibling.
+      hits = hits.filter((el) => !hits.some((o) => o !== el && el.contains(o)));
+      if (!hits.length) return { error: 'no visible match' };
+      const el = hits[${Number(nth)}];
+      if (!el) return { error: 'nth out of range', count: hits.length };
+      el.scrollIntoView({ block: 'center', inline: 'center' });
+      const r = el.getBoundingClientRect();
+      return {
+        x: r.left + r.width / 2,
+        y: r.top + r.height / 2,
+        count: hits.length,
+        tag: el.tagName.toLowerCase(),
+        label: label(el).slice(0, 60),
+      };
+    })()`,
+  );
+  if (!found || found.error) {
+    const extra = found && found.count !== undefined ? ` (${found.count} visible match(es))` : '';
+    die(`clicktext: ${found ? found.error : 'evaluate returned nothing'} for ${jsString(text)}${extra}`);
+  }
+  return found;
+}
+
+async function realClick(sessionId, x, y) {
+  // A short hover before the press produces a more human-looking event stream
+  // than a bare mousePressed, and costs nothing.
+  await send('Input.dispatchMouseEvent', { type: 'mouseMoved', x, y, button: 'none' }, sessionId);
+  await sleep(40 + Math.random() * 80);
+  const base = { x, y, button: 'left', clickCount: 1 };
+  await send('Input.dispatchMouseEvent', { ...base, type: 'mousePressed' }, sessionId);
+  await sleep(30 + Math.random() * 50);
+  await send('Input.dispatchMouseEvent', { ...base, type: 'mouseReleased' }, sessionId);
+}
+
+const NAMED_KEYS = {
+  Enter: { code: 'Enter', windowsVirtualKeyCode: 13, text: '\r' },
+  Tab: { code: 'Tab', windowsVirtualKeyCode: 9 },
+  Escape: { code: 'Escape', windowsVirtualKeyCode: 27 },
+  Backspace: { code: 'Backspace', windowsVirtualKeyCode: 8 },
+  ArrowDown: { code: 'ArrowDown', windowsVirtualKeyCode: 40 },
+  ArrowUp: { code: 'ArrowUp', windowsVirtualKeyCode: 38 },
+};
+
+async function pressKey(sessionId, key) {
+  const spec = NAMED_KEYS[key];
+  if (!spec) die(`unsupported key: ${key} (known: ${Object.keys(NAMED_KEYS).join(', ')})`);
+  await send('Input.dispatchKeyEvent', { type: 'keyDown', key, ...spec }, sessionId);
+  await send('Input.dispatchKeyEvent', { type: 'keyUp', key, ...spec }, sessionId);
+}
+
+async function typeText(sessionId, text) {
+  for (const ch of text) {
+    await send('Input.dispatchKeyEvent', { type: 'keyDown', text: ch, key: ch }, sessionId);
+    await send('Input.dispatchKeyEvent', { type: 'keyUp', key: ch }, sessionId);
+    await sleep(35 + Math.random() * 75);
+  }
+}
+
+function readStdin() {
+  return new Promise((resolve) => {
+    let buf = '';
+    process.stdin.setEncoding('utf8');
+    process.stdin.on('data', (d) => (buf += d));
+    process.stdin.on('end', () => resolve(buf.replace(/\n$/, '')));
+  });
+}
+
+/* ------------------------------------------------------------------ *
+ * Commands
+ * ------------------------------------------------------------------ */
+
+await connect();
+
+try {
+  switch (cmd) {
+    case 'status': {
+      const version = await cdpVersion();
+      const pages = await liveTargets();
+      const saved = readState().targetId;
+      console.log(`browser:  ${version.Browser}`);
+      console.log(`port:     ${PORT}`);
+      console.log(`profile:  ${PROFILE_DIR}`);
+      console.log(`tabs:     ${pages.length}`);
+      for (const p of pages) {
+        console.log(`  ${p.targetId === saved ? '*' : ' '} ${p.url.slice(0, 100)}`);
+      }
+      console.log(saved ? '\n(* = stealth tab)' : '\nno stealth tab tracked yet');
+      break;
+    }
+
+    case 'focus': {
+      const { targetId, sessionId } = await resolveTarget();
+      await send('Target.activateTarget', { targetId });
+      await send('Page.bringToFront', {}, sessionId).catch(() => {});
+      console.log(`raised: ${await evaluate(sessionId, 'location.href')}`);
+      break;
+    }
+
+    case 'open': {
+      const url = args[0] || die('usage: stealth-cdp open <url>');
+      const { sessionId, targetId } = await resolveTarget({ createUrl: url });
+      await send('Page.navigate', { url }, sessionId);
+      await send('Target.activateTarget', { targetId });
+      await sleep(2500);
+      console.log(await evaluate(sessionId, 'document.readyState + " " + location.href'));
+      break;
+    }
+
+    case 'url': {
+      const { sessionId } = await resolveTarget();
+      console.log(await evaluate(sessionId, 'location.href'));
+      break;
+    }
+
+    case 'text': {
+      const { sessionId } = await resolveTarget();
+      const sel = args[0] || 'body';
+      console.log(
+        await evaluate(
+          sessionId,
+          `(document.querySelector(${jsString(sel)}) || {}).innerText || ''`,
+        ),
+      );
+      break;
+    }
+
+    case 'html': {
+      const { sessionId } = await resolveTarget();
+      const sel = args[0] || 'html';
+      console.log(
+        await evaluate(
+          sessionId,
+          `((document.querySelector(${jsString(sel)}) || {}).outerHTML || '').slice(0, 20000)`,
+        ),
+      );
+      break;
+    }
+
+    case 'eval': {
+      const { sessionId } = await resolveTarget();
+      const expr = args.join(' ') || die('usage: stealth-cdp eval <expression>');
+      const value = await evaluate(sessionId, expr);
+      console.log(typeof value === 'string' ? value : JSON.stringify(value, null, 2));
+      break;
+    }
+
+    case 'click': {
+      const { sessionId } = await resolveTarget();
+      const sel = args[0] || die('usage: stealth-cdp click <selector>');
+      const { x, y } = await boxOf(sessionId, sel);
+      await realClick(sessionId, x, y);
+      console.log(`clicked ${sel} at ${Math.round(x)},${Math.round(y)}`);
+      break;
+    }
+
+    case 'clicktext': {
+      const { sessionId } = await resolveTarget();
+      const flags = args.filter((a) => a.startsWith('--'));
+      const words = args.filter((a) => !a.startsWith('--'));
+      const text = words.join(' ') || die('usage: stealth-cdp clicktext <text> [--nth=N] [--scope=<css>] [--contains] [--any]');
+      const flagValue = (name) => {
+        const hit = flags.find((f) => f.startsWith(`--${name}=`));
+        return hit ? hit.slice(name.length + 3) : undefined;
+      };
+      const hit = await boxOfText(sessionId, text, {
+        nth: Number(flagValue('nth') || 0),
+        scope: flagValue('scope'),
+        contains: flags.includes('--contains'),
+        any: flags.includes('--any'),
+      });
+      await realClick(sessionId, hit.x, hit.y);
+      const ambiguous = hit.count > 1 ? ` [${hit.count} matches, used --nth=${Number(flagValue('nth') || 0)}]` : '';
+      console.log(
+        `clicked <${hit.tag}> "${hit.label}" at ${Math.round(hit.x)},${Math.round(hit.y)}${ambiguous}`,
+      );
+      break;
+    }
+
+    case 'typefocused': {
+      // Types into whatever currently has focus. Needed for cross-origin
+      // iframes, where no selector from the top frame can reach the field.
+      const { sessionId } = await resolveTarget();
+      const value = args[0] === '--stdin' ? await readStdin() : args.join(' ');
+      if (!value) die('usage: stealth-cdp typefocused <text>|--stdin');
+      await typeText(sessionId, value);
+      console.log(`typed ${value.length} chars into the focused element`);
+      break;
+    }
+
+    case 'clickxy': {
+      // Cross-origin iframes (SSO widgets, payment frames) are unreachable by
+      // selector from the top frame, but a real mouse event at viewport
+      // coordinates still lands inside them.
+      const { sessionId } = await resolveTarget();
+      const x = Number(args[0]);
+      const y = Number(args[1]);
+      if (!Number.isFinite(x) || !Number.isFinite(y)) die('usage: stealth-cdp clickxy <x> <y>');
+      await realClick(sessionId, x, y);
+      console.log(`clicked at ${x},${y}`);
+      break;
+    }
+
+    case 'type': {
+      const { sessionId } = await resolveTarget();
+      const sel = args[0] || die('usage: stealth-cdp type <selector> <text>|--stdin');
+      const value = args[1] === '--stdin' ? await readStdin() : args.slice(1).join(' ');
+      if (!value) die('nothing to type');
+      const { x, y } = await boxOf(sessionId, sel);
+      await realClick(sessionId, x, y);
+      await sleep(150);
+      await typeText(sessionId, value);
+      console.log(`typed ${value.length} chars into ${sel}`);
+      break;
+    }
+
+    case 'key': {
+      const { sessionId } = await resolveTarget();
+      await pressKey(sessionId, args[0] || die('usage: stealth-cdp key <Key>'));
+      console.log(`pressed ${args[0]}`);
+      break;
+    }
+
+    case 'wait': {
+      const { sessionId } = await resolveTarget();
+      const sel = args[0] || die('usage: stealth-cdp wait <selector> [timeoutMs]');
+      const timeout = Number(args[1] || 15000);
+      const deadline = Date.now() + timeout;
+      while (Date.now() < deadline) {
+        if (await evaluate(sessionId, `!!document.querySelector(${jsString(sel)})`)) {
+          console.log(`found ${sel}`);
+          process.exit(0);
+        }
+        await sleep(400);
+      }
+      die(`timed out waiting for ${sel}`);
+      break;
+    }
+
+    case 'shot': {
+      const { sessionId } = await resolveTarget();
+      const out = args[0] || path.join(RUNTIME_DIR, 'stealth-shot.png');
+      const { data } = await send('Page.captureScreenshot', { format: 'png' }, sessionId);
+      fs.mkdirSync(path.dirname(out), { recursive: true });
+      fs.writeFileSync(out, Buffer.from(data, 'base64'));
+      console.log(out);
+      break;
+    }
+
+    case 'net': {
+      const { sessionId } = await resolveTarget();
+      const needle = args[0] || '';
+      // performance.getEntriesByType exposes responseStatus, so we get status
+      // codes without ever enabling the Network domain.
+      const rows = await evaluate(
+        sessionId,
+        `performance.getEntriesByType('resource')
+          .filter(e => e.name.includes(${jsString(needle)}))
+          .map(e => ({ status: e.responseStatus, url: e.name.slice(0, 130) }))`,
+      );
+      for (const r of rows) console.log(`${String(r.status).padEnd(5)} ${r.url}`);
+      console.log(`\n${rows.length} requests`);
+      break;
+    }
+
+    case 'close': {
+      const { targetId } = readState();
+      if (targetId) await send('Target.closeTarget', { targetId }).catch(() => {});
+      writeState({});
+      console.log('stealth tab closed');
+      break;
+    }
+
+    default:
+      die(`unknown command: ${cmd} (try --help)`);
+  }
+} finally {
+  ws.close();
+  // The websocket keeps a handle open long enough to stall exit, so flush
+  // stdout and leave deliberately.
+  await new Promise((r) => process.stdout.write('', r));
+  process.exit(process.exitCode ?? 0);
+}

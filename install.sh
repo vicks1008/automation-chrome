@@ -94,6 +94,12 @@ install -m 0755 "$REPO_DIR/mcp/chrome-devtools-mcp-filtered.mjs" "$RUNTIME_DIR/"
 install -m 0755 "$REPO_DIR/mcp/probe-mcp.mjs"                    "$RUNTIME_DIR/"
 install -m 0644 "$REPO_DIR/mcp/package.json"                     "$RUNTIME_DIR/"
 
+say "Installing bot-detection tools to $RUNTIME_DIR"
+for f in "$REPO_DIR"/tools/*.mjs; do
+  install -m 0755 "$f" "$RUNTIME_DIR/$(basename "$f")"
+  echo "    $(basename "$f")"
+done
+
 # The wrapper resolves chrome-devtools-mcp with createRequire from its own
 # directory, which cannot see globally-installed packages. The local install
 # is what pins the version — do not replace it with `npm i -g`.
