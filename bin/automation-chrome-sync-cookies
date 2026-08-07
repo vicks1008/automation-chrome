@@ -1,0 +1,128 @@
+#!/usr/bin/env bash
+#
+# automation-chrome-sync-cookies — copy cookies / local storage from your
+# main Chrome profile into the automation profile so you don't have to log
+# into everything twice.
+#
+# READ THIS FIRST: do not use it on sites behind bot management (Akamai,
+# Kasada, DataDome). Their cookies are bound to the fingerprint of the
+# browser that minted them, so replaying them from another instance looks
+# like cookie theft and actively causes blocks. Log in inside the automation
+# window instead. See README, "Bot detection".
+#
+# Safe tradeoffs:
+#   * SQLite stores (Cookies, Login Data, Web Data, History) are copied via
+#     `sqlite3 .backup`, which works even while the source Chrome has the
+#     DB open. The backup is atomic.
+#   * LevelDB directories (Local Storage, IndexedDB, Service Worker) are
+#     rsynced. If the source is actively writing these get a best-effort
+#     snapshot. For a pristine copy, quit your main Chrome briefly first.
+#   * Automation Chrome is stopped before the copy so we never write into
+#     a profile that's in use.
+#
+# Prereqs:
+#   * Chrome on Mac encrypts cookies with a keychain key called
+#     "Chrome Safe Storage". That key is user-level (not profile-level) so
+#     the automation profile can decrypt the copied DB. The first time
+#     automation Chrome reads cookies it will pop a keychain prompt —
+#     click "Always Allow".
+#
+# Usage:
+#   automation-chrome-sync-cookies              # copy Default profile, light sync
+#   automation-chrome-sync-cookies --full       # also copy IndexedDB + Service Worker (slow)
+#   automation-chrome-sync-cookies "Profile 1"  # copy a named profile
+
+set -euo pipefail
+
+FULL_SYNC=0
+SRC_NAME=""
+for arg in "$@"; do
+  case "$arg" in
+    --full) FULL_SYNC=1 ;;
+    *)      SRC_NAME="$arg" ;;
+  esac
+done
+SRC_NAME="${SRC_NAME:-Default}"
+
+SRC="$HOME/Library/Application Support/Google/Chrome/$SRC_NAME"
+DST="$HOME/Library/Application Support/Google/Chrome/CursorAutomation/Default"
+LABEL="com.local.automation-chrome"
+
+if [[ ! -d "$SRC" ]]; then
+  echo "[sync] ERROR: source profile not found: $SRC" >&2
+  echo "       Available profiles:" >&2
+  ls "$HOME/Library/Application Support/Google/Chrome" 2>/dev/null \
+    | grep -E '^(Default|Profile [0-9]+|Guest Profile)$' >&2 || true
+  exit 1
+fi
+
+if ! command -v sqlite3 >/dev/null 2>&1; then
+  echo "[sync] ERROR: sqlite3 is required (macOS ships with it — is PATH broken?)" >&2
+  exit 1
+fi
+
+echo "[sync] source: $SRC"
+echo "[sync] target: $DST"
+
+echo "[sync] stopping automation Chrome if running..."
+pkill -f "user-data-dir=.*CursorAutomation" 2>/dev/null || true
+sleep 1
+
+mkdir -p "$DST"
+
+SQLITE_DBS=(Cookies "Login Data" "Web Data" History)
+SYNC_FAILURES=()
+for db in "${SQLITE_DBS[@]}"; do
+  if [[ ! -f "$SRC/$db" ]]; then
+    echo "[sync]   skip (missing): $db"
+    continue
+  fi
+  echo -n "[sync]   hot-backup: $db ... "
+  if sqlite3 "$SRC/$db" ".backup '$DST/$db'" 2>/dev/null; then
+    echo "ok"
+  else
+    echo "LOCKED (skipped)"
+    SYNC_FAILURES+=("$db")
+  fi
+done
+
+# Default sync includes Local Storage (typically < 100 MB, often carries
+# auth tokens). IndexedDB + Service Worker can be multi-GB and are almost
+# never needed for session recovery — opt in with --full.
+LEVELDB_DIRS=("Local Storage")
+if [[ "$FULL_SYNC" == "1" ]]; then
+  LEVELDB_DIRS+=("IndexedDB" "Service Worker")
+fi
+
+for dir in "${LEVELDB_DIRS[@]}"; do
+  if [[ -d "$SRC/$dir" ]]; then
+    size=$(du -sh "$SRC/$dir" 2>/dev/null | awk '{print $1}')
+    echo "[sync]   rsync: $dir ($size)"
+    rsync -aq --delete "$SRC/$dir/" "$DST/$dir/"
+  else
+    echo "[sync]   skip (missing): $dir"
+  fi
+done
+
+if [[ "$FULL_SYNC" != "1" ]]; then
+  INDEXEDDB_SIZE=$(du -sh "$SRC/IndexedDB" 2>/dev/null | awk '{print $1}' || echo "?")
+  SW_SIZE=$(du -sh "$SRC/Service Worker" 2>/dev/null | awk '{print $1}' || echo "?")
+  echo "[sync]   skipped IndexedDB ($INDEXEDDB_SIZE) and Service Worker ($SW_SIZE) — pass --full if you need them"
+fi
+
+if [[ ${#SYNC_FAILURES[@]} -gt 0 ]]; then
+  echo
+  echo "[sync] NOTE: these DBs were locked by main Chrome and skipped:"
+  for db in "${SYNC_FAILURES[@]}"; do echo "        - $db"; done
+  echo "       Cookies is the only one that matters for web sessions. If you"
+  echo "       specifically need 'Login Data' (saved passwords) or 'History',"
+  echo "       quit main Chrome and re-run this script."
+fi
+
+echo
+echo "[sync] done."
+echo "[sync] Relaunching automation Chrome via launchd..."
+launchctl kickstart -k "gui/$(id -u)/$LABEL" 2>/dev/null \
+  || "$(dirname "$0")/automation-chrome"
+echo "[sync] visit your authenticated sites in the automation Chrome window"
+echo "       to confirm sessions carried over."

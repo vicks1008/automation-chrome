@@ -1,0 +1,10 @@
+{
+  "name": "automation-chrome-mcp-wrapper",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Local pin of chrome-devtools-mcp so chrome-devtools-mcp-filtered.mjs resolves a deterministic version.",
+  "type": "module",
+  "dependencies": {
+    "chrome-devtools-mcp": "^1.6.0"
+  }
+}

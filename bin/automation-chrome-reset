@@ -1,0 +1,67 @@
+#!/usr/bin/env bash
+#
+# automation-chrome-reset — recover the Chrome automation stack.
+#
+# What it does:
+#   1. Kills any lingering chrome-devtools-mcp processes (they often wedge
+#      on Network.enable timeouts when Chrome is slow — see GH #775).
+#      The client auto-respawns the MCP on the next tool call.
+#   2. If automation Chrome is unresponsive, restarts it through launchd.
+#   3. Runs a health check and prints the final state.
+#
+# This is the "turn it off and on again" button. Safe to run any time the
+# MCP acts stuck.
+
+set -euo pipefail
+
+DEBUG_PORT="${AUTOMATION_CHROME_DEBUG_PORT:-9333}"
+URL="http://127.0.0.1:$DEBUG_PORT"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+LABEL="com.local.automation-chrome"
+PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
+
+echo "[reset] terminating any chrome-devtools-mcp processes..."
+KILLED=0
+for pid in $(pgrep -f "chrome-devtools-mcp" || true); do
+  echo "[reset]   kill $pid"
+  kill "$pid" 2>/dev/null && KILLED=$((KILLED+1)) || true
+done
+
+if [[ "$KILLED" -gt 0 ]]; then
+  sleep 1
+  for pid in $(pgrep -f "chrome-devtools-mcp" || true); do
+    echo "[reset]   SIGKILL $pid (still alive)"
+    kill -9 "$pid" 2>/dev/null || true
+  done
+fi
+
+echo "[reset] checking automation Chrome on $URL ..."
+if curl -sSf --max-time 2 "$URL/json/version" >/dev/null 2>&1; then
+  echo "[reset] automation Chrome is responsive"
+else
+  echo "[reset] automation Chrome not responding; restarting via launchd"
+  # launchd, not a direct call: Chrome started from a shell dies with the
+  # shell's process group. See README, "Start it with launchd".
+  if launchctl kickstart -k "gui/$(id -u)/$LABEL" 2>/dev/null; then
+    echo "[reset]   kickstarted $LABEL"
+  elif [[ -f "$PLIST" ]]; then
+    echo "[reset]   service not loaded; bootstrapping"
+    launchctl bootstrap "gui/$(id -u)" "$PLIST"
+  else
+    echo "[reset]   no LaunchAgent installed; falling back to direct launch"
+    echo "[reset]   (this Chrome will not survive the calling shell — install the agent)"
+    "$SCRIPT_DIR/automation-chrome"
+  fi
+  for _ in $(seq 1 20); do
+    sleep 0.5
+    curl -sSf --max-time 2 "$URL/json/version" >/dev/null 2>&1 && break
+  done
+fi
+
+echo
+"$SCRIPT_DIR/automation-chrome-health"
+
+echo
+echo "[reset] done. If an MCP call is still wedged, restart the MCP client:"
+echo "        Cursor      → Settings → Features → MCP, toggle off/on"
+echo "        Claude Code → /mcp, or restart the session"

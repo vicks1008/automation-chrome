@@ -1,0 +1,115 @@
+#!/usr/bin/env bash
+#
+# automation-chrome — launch the dedicated Chrome instance that the
+# chrome-devtools MCP connects to.
+#
+# Design goals:
+#   * Isolated from your main Chrome profile (different user-data-dir).
+#   * Stable remote-debugging port so MCP config never changes.
+#   * Idempotent — safe to call when it's already running.
+#   * Backgroundable (default) or foregroundable (for launchd).
+#
+# Env vars:
+#   AUTOMATION_CHROME_FOREGROUND=1   Exec Chrome in the foreground (launchd).
+#   AUTOMATION_CHROME_DEBUG_PORT     Override debug port (default: 9333).
+#   AUTOMATION_CHROME_HOME           Runtime dir (default: ~/.automation-chrome).
+#
+# Sister scripts:
+#   automation-chrome-health         Check if the port / CDP is responsive.
+#   automation-chrome-reset          Nuke stale MCP + relaunch Chrome if down.
+#   automation-chrome-sync-cookies   Copy cookies from your main profile.
+
+set -euo pipefail
+
+CHROME_BIN="/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+PROFILE_DIR="$HOME/Library/Application Support/Google/Chrome/CursorAutomation"
+# 9333 deliberately, not 9222. A main Chrome previously launched with
+# --remote-debugging-port squats 9222 on IPv4 and answers slowly or not at all
+# because of its pile of suspended tabs. Separate ports mean the MCP only ever
+# talks to the clean automation profile.
+DEBUG_PORT="${AUTOMATION_CHROME_DEBUG_PORT:-9333}"
+LOG_DIR="${AUTOMATION_CHROME_HOME:-$HOME/.automation-chrome}"
+LOG_FILE="$LOG_DIR/automation-chrome.log"
+
+mkdir -p "$PROFILE_DIR" "$LOG_DIR"
+
+# The MCP protocol log records full CDP traffic, which includes request bodies
+# and page content -- it grows without bound and can capture anything typed
+# into a form. Keep one generation and cap it at 32MB.
+MAX_LOG_BYTES=$((32 * 1024 * 1024))
+for log in "$LOG_DIR"/chrome-devtools-mcp.log "$LOG_DIR"/automation-chrome.log \
+           "$LOG_DIR"/automation-chrome.launchd.err.log; do
+  [[ -f "$log" ]] || continue
+  size=$(stat -f%z "$log" 2>/dev/null || echo 0)
+  if (( size > MAX_LOG_BYTES )); then
+    mv -f "$log" "$log.1"
+    : >"$log"
+    echo "[automation-chrome] rotated $(basename "$log") (was $((size / 1024 / 1024))MB)"
+  fi
+done
+
+if [[ ! -x "$CHROME_BIN" ]]; then
+  echo "[automation-chrome] ERROR: Chrome not found at $CHROME_BIN" >&2
+  echo "                    Install it: brew install --cask google-chrome" >&2
+  exit 1
+fi
+
+if lsof -iTCP:"$DEBUG_PORT" -sTCP:LISTEN -P -n >/dev/null 2>&1; then
+  echo "[automation-chrome] already running on port $DEBUG_PORT"
+  exit 0
+fi
+
+CHROME_ARGS=(
+  "--user-data-dir=$PROFILE_DIR"
+  "--remote-debugging-port=$DEBUG_PORT"
+  "--remote-allow-origins=*"
+  "--no-first-run"
+  "--no-default-browser-check"
+  "--disable-default-apps"
+  "--disable-sync"
+  "--disable-features=ChromeWhatsNewUI,OptimizationGuideModelDownloading"
+  # Required for chrome-devtools-mcp --categoryExperimentalWebmcp (Chrome 149+).
+  # The feature was named WebMCPTesting in earlier builds; chrome-devtools-mcp
+  # 1.6.0 documents it as WebMCP. Both are listed so the flag keeps working
+  # across Chrome versions -- an unknown feature name is ignored, not fatal.
+  "--enable-features=WebMCP,WebMCPTesting,DevToolsWebMCPSupport"
+  "--hide-crash-restore-bubble"
+  "--disable-session-crashed-bubble"
+  "--disable-infobars"
+  "--disable-background-networking"
+  "about:blank"
+)
+
+if [[ "${AUTOMATION_CHROME_FOREGROUND:-0}" == "1" ]]; then
+  # Under launchd, we want to be the authoritative owner so crash-restart
+  # works. Kill any pre-existing automation Chrome so our exec'd child is
+  # the one launchd supervises.
+  for pid in $(pgrep -f "user-data-dir=.*CursorAutomation" 2>/dev/null || true); do
+    kill "$pid" 2>/dev/null || true
+  done
+  for _ in 1 2 3 4 5; do
+    if ! lsof -iTCP:"$DEBUG_PORT" -sTCP:LISTEN -P -n >/dev/null 2>&1; then
+      break
+    fi
+    sleep 1
+  done
+  echo "[automation-chrome] foreground exec on port $DEBUG_PORT"
+  exec "$CHROME_BIN" "${CHROME_ARGS[@]}"
+fi
+
+nohup "$CHROME_BIN" "${CHROME_ARGS[@]}" </dev/null >>"$LOG_FILE" 2>&1 &
+CHROME_PID=$!
+disown
+
+echo "[automation-chrome] launched (pid $CHROME_PID); log: $LOG_FILE"
+
+for _ in $(seq 1 20); do
+  sleep 0.5
+  if lsof -iTCP:"$DEBUG_PORT" -sTCP:LISTEN -P -n >/dev/null 2>&1; then
+    echo "[automation-chrome] ready on port $DEBUG_PORT"
+    exit 0
+  fi
+done
+
+echo "[automation-chrome] WARNING: port $DEBUG_PORT not listening after 10s" >&2
+exit 1

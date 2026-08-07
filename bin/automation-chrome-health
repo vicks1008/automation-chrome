@@ -1,0 +1,59 @@
+#!/usr/bin/env bash
+#
+# automation-chrome-health — verify the automation Chrome + CDP endpoint.
+#
+# Exits 0 if healthy, non-zero otherwise. Prints a short human-readable
+# summary. Useful both as a diagnostic and in the reset script.
+
+set -euo pipefail
+
+DEBUG_PORT="${AUTOMATION_CHROME_DEBUG_PORT:-9333}"
+URL="http://127.0.0.1:$DEBUG_PORT"
+
+section() { printf '  %-22s %s\n' "$1" "$2"; }
+
+echo "[health] checking automation Chrome stack (port $DEBUG_PORT)"
+
+CHROME_PIDS="$(pgrep -f "user-data-dir=.*CursorAutomation" || true)"
+if [[ -n "$CHROME_PIDS" ]]; then
+  MAIN_PID=$(echo "$CHROME_PIDS" | head -1)
+  HELPER_COUNT=$(echo "$CHROME_PIDS" | wc -l | tr -d ' ')
+  section "chrome process" "OK (main pid $MAIN_PID, $HELPER_COUNT total procs)"
+else
+  section "chrome process" "MISSING"
+fi
+
+if lsof -iTCP:"$DEBUG_PORT" -sTCP:LISTEN -P -n >/dev/null 2>&1; then
+  section "port $DEBUG_PORT" "LISTENING"
+else
+  section "port $DEBUG_PORT" "CLOSED"
+  echo
+  echo "[health] Chrome is not listening on $DEBUG_PORT."
+  echo "         Start it with launchd, not from a shell:"
+  echo "           launchctl kickstart -k gui/\$(id -u)/com.local.automation-chrome"
+  exit 1
+fi
+
+VERSION_JSON="$(curl -sS --max-time 3 "$URL/json/version" || true)"
+if [[ -z "$VERSION_JSON" ]]; then
+  section "/json/version" "NO RESPONSE"
+  exit 2
+fi
+
+BROWSER=$(printf '%s' "$VERSION_JSON" | python3 -c 'import json,sys;d=json.load(sys.stdin);print(d.get("Browser",""))' 2>/dev/null || true)
+WS=$(printf '%s'       "$VERSION_JSON" | python3 -c 'import json,sys;d=json.load(sys.stdin);print(d.get("webSocketDebuggerUrl",""))' 2>/dev/null || true)
+
+section "browser build" "${BROWSER:-unknown}"
+section "devtools ws" "${WS:-<missing>}"
+
+PAGES_COUNT=$(curl -sS --max-time 3 "$URL/json" | python3 -c 'import json,sys;print(len(json.load(sys.stdin)))' 2>/dev/null || echo "?")
+section "open targets" "$PAGES_COUNT"
+
+MCP_PIDS="$(pgrep -f "chrome-devtools-mcp" || true)"
+if [[ -n "$MCP_PIDS" ]]; then
+  section "mcp processes" "$(echo "$MCP_PIDS" | tr '\n' ' ')"
+else
+  section "mcp processes" "none (the client will spawn on demand)"
+fi
+
+echo "[health] OK"
