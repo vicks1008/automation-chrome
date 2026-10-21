@@ -12,22 +12,12 @@
  * One variant per invocation so each run gets a pristine process and profile.
  *
  * Usage:
- *   node kasada-ab-test.mjs --username=you@example.com --variant=clean
- *   node kasada-ab-test.mjs --username=you@example.com --variant=runtime
- *   node kasada-ab-test.mjs --username=you@example.com --variant=clean --flags=vanilla
+ *   node kasada-ab-test.mjs --variant=clean   --flags=automation
+ *   node kasada-ab-test.mjs --variant=noisy   --flags=automation
+ *   node kasada-ab-test.mjs --variant=clean   --flags=vanilla
  *
- *   --username=  required; the value typed into the login field
- *   --variant=   clean | noisy | runtime | network | log | dom | evaluate
- *                clean   nothing but Page enabled (stealthy)
- *                noisy   Runtime + Network + Log (what puppeteer does)
- *                others  one domain at a time, to isolate the trigger
- *   --flags=     automation (mirrors the real automation Chrome) | vanilla
- *   --url=       page under test; defaults to GoDaddy SSO
- *   --port=      CDP port for the throwaway browser
- *
- * The result probe is shaped for GoDaddy SSO — it looks for
- * `input[name=username]`, `#browser-error-modal` and the `checkusername` XHR.
- * Point --url elsewhere and you will need to adjust those selectors too.
+ *   --variant=clean  only Page domain is enabled (stealthy)
+ *   --variant=noisy  Runtime + Network + Log enabled (what puppeteer does)
  */
 
 import { spawn } from 'node:child_process';
@@ -45,19 +35,10 @@ const flag = (name, fallback) => {
 const VARIANT = flag('variant', 'clean');
 const FLAG_SET = flag('flags', 'automation');
 const PORT = Number(flag('port', String(9440 + Math.floor(Math.random() * 40))));
-const USERNAME = flag('username');
-if (!USERNAME) {
-  console.error('kasada-ab-test: --username=<value> is required (typed into the login field)');
-  process.exit(2);
-}
-const URL_UNDER_TEST = flag(
-  'url',
-  'https://sso.godaddy.com/?realm=idp&app=venture-redirector&path=%2F%3Freferrer%3Dsso',
-);
-const OUT_DIR = path.join(
-  process.env.AUTOMATION_CHROME_HOME || path.join(os.homedir(), '.automation-chrome'),
-  'kasada-ab',
-);
+const USERNAME = flag('username', 'you@example.com');
+const URL_UNDER_TEST =
+  'https://sso.godaddy.com/?realm=idp&app=venture-redirector&path=%2F%3Freferrer%3Dsso';
+const OUT_DIR = path.join(os.homedir(), '.cursor', 'mcp-wrappers', 'kasada-ab');
 
 const AUTOMATION_FLAGS = [
   '--no-first-run',
@@ -65,9 +46,7 @@ const AUTOMATION_FLAGS = [
   '--disable-default-apps',
   '--disable-sync',
   '--disable-features=ChromeWhatsNewUI,OptimizationGuideModelDownloading',
-  // Kept identical to bin/automation-chrome so the harness measures the real
-  // automation browser rather than an approximation of it.
-  '--enable-features=WebMCP,WebMCPTesting,DevToolsWebMCPSupport',
+  '--enable-features=WebMCPTesting,DevToolsWebMCPSupport',
   '--hide-crash-restore-bubble',
   '--disable-session-crashed-bubble',
   '--disable-infobars',

@@ -1,21 +1,11 @@
 #!/usr/bin/env node
 /**
- * Inspect (and optionally clear) bot-management storage for a domain in a
- * live Chrome, over raw CDP.
- *
- * Nothing here is GoDaddy-specific despite the name and the default needle —
- * any domain substring works. `clear` is the fix when a site that used to work
- * starts returning bot-management challenges: its cookies are bound to the
- * fingerprint of whatever minted them, and once marked bad they stay bad until
- * the site is allowed to mint fresh ones.
+ * Inspect (and optionally clear) bot-management storage for a domain in the
+ * live automation Chrome, over raw CDP.
  *
  * Usage:
  *   node gd-cookies.mjs list  [domainSubstring]
  *   node gd-cookies.mjs clear [domainSubstring]
- *
- * Targets port 9333 (the automation Chrome) by default. To operate on the
- * stealth Chrome instead:
- *   AUTOMATION_CHROME_DEBUG_PORT=9334 node gd-cookies.mjs list godaddy
  */
 
 const PORT = Number(process.env.AUTOMATION_CHROME_DEBUG_PORT || 9333);

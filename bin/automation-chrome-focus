@@ -1,0 +1,103 @@
+#!/usr/bin/env node
+/**
+ * automation-chrome-focus — deliberately raise the automation Chrome window.
+ *
+ * The focus-guard proxy (port 9333) strips Page.bringToFront / activateTarget so
+ * agent automation never pulls focus. This command is the sanctioned escape
+ * hatch for the rare moment a human must act inside the window (log in, enter an
+ * MFA code). It talks straight to Chrome on its internal port (9335), bypassing
+ * the guard, so the raise actually happens.
+ *
+ * Usage:
+ *   automation-chrome-focus                 # raise the most recent page
+ *   automation-chrome-focus <targetId>      # raise a specific target id
+ *   automation-chrome-focus <url-substring> # raise the first page whose URL matches
+ *
+ * Env:
+ *   AUTOMATION_CHROME_DEBUG_PORT   Chrome's internal port (default 9335)
+ */
+
+import { createRequire } from 'node:module';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
+
+const execFileP = promisify(execFile);
+
+// Resolve `ws` from the mcp-wrappers install (same place the proxy uses).
+// The runtime dir is fixed by install.sh; derive it from HOME so this script
+// is portable across machines instead of carrying a hardcoded user path.
+const require = createRequire(`${process.env.HOME}/.cursor/mcp-wrappers/`);
+const { WebSocket } = require('ws');
+
+const CHROME_PORT = Number(process.env.AUTOMATION_CHROME_DEBUG_PORT || 9335);
+const CHROME_HTTP = `http://127.0.0.1:${CHROME_PORT}`;
+const arg = process.argv[2];
+
+function die(msg) {
+  console.error(`[focus] ${msg}`);
+  process.exit(1);
+}
+
+async function main() {
+  let list;
+  try {
+    const res = await fetch(`${CHROME_HTTP}/json`);
+    list = await res.json();
+  } catch (err) {
+    die(`cannot reach Chrome on ${CHROME_HTTP} (${err.message}). Is it running? Try: automation-chrome`);
+  }
+
+  const pages = list.filter((t) => t.type === 'page');
+  if (pages.length === 0) die('no page targets to raise');
+
+  let target;
+  if (arg) {
+    target = pages.find((t) => t.id === arg)
+      || pages.find((t) => (t.url || '').includes(arg));
+    if (!target) die(`no page target matching "${arg}"`);
+  } else {
+    // Chrome lists the most recently active/created target first.
+    target = pages[0];
+  }
+
+  // 1. Select the right tab/window inside Chrome.
+  try {
+    await fetch(`${CHROME_HTTP}/json/activate/${target.id}`);
+  } catch {}
+
+  // 2. Make that tab the foreground tab of its window.
+  await new Promise((resolve) => {
+    const ws = new WebSocket(target.webSocketDebuggerUrl, { perMessageDeflate: false });
+    const done = () => { try { ws.close(); } catch {} resolve(); };
+    const timer = setTimeout(done, 5000);
+    ws.on('open', () => {
+      ws.send(JSON.stringify({ id: 1, method: 'Page.bringToFront' }));
+    });
+    ws.on('message', (data) => {
+      let msg;
+      try { msg = JSON.parse(data.toString()); } catch { return; }
+      if (msg.id === 1) { clearTimeout(timer); done(); }
+    });
+    ws.on('error', () => { clearTimeout(timer); done(); });
+  });
+
+  // 3. Bring the automation Chrome app to the front. Page.bringToFront alone is
+  //    unreliable here because the main Chrome shares the same bundle id, so we
+  //    raise the exact CursorAutomation process by its unix pid.
+  try {
+    const { stdout } = await execFileP('pgrep', ['-f', 'user-data-dir=.*CursorAutomation']);
+    const pid = stdout.split('\n').map((s) => s.trim()).filter(Boolean)[0];
+    if (pid) {
+      await execFileP('osascript', [
+        '-e',
+        `tell application "System Events" to set frontmost of (first process whose unix id is ${pid}) to true`,
+      ]);
+    }
+  } catch (err) {
+    console.error(`[focus] could not raise the window automatically (${err.message}); the tab is selected, click the CursorAutomation Chrome manually`);
+  }
+
+  console.log(`[focus] raised: ${target.title || '(untitled)'} — ${target.url || ''}`);
+}
+
+main();

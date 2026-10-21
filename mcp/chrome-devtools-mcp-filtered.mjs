@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * chrome-devtools-mcp wrapper for Cursor / Claude Code.
+ * chrome-devtools-mcp wrapper for Cursor.
  *
  * Adds target filtering via env vars so --autoConnect doesn't hang when
  * the user's Chrome has many suspended tabs (see upstream issues #775, #1156).
@@ -21,7 +21,7 @@
  *
  * Install chrome-devtools-mcp LOCALLY in this folder so `createRequire` can
  * resolve it deterministically (a global `npm i -g` is NOT visible here):
- *     cd ~/.automation-chrome && npm install chrome-devtools-mcp@latest
+ *     cd ~/.cursor/mcp-wrappers && npm install chrome-devtools-mcp@latest
  * (Falls back to a `npx`-cached copy if no local/global install is found.)
  */
 

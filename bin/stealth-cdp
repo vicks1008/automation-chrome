@@ -35,16 +35,9 @@
  *
  * So this driver runs its own Chrome on a separate port (9334) with its own
  * profile. The MCP is pointed at 9333 and cannot see it. The profile persists,
- * so logins survive across runs. `CDM_EXCLUDE_URL_PATTERNS` in the MCP's env
- * (see ~/.cursor/mcp.json or `claude mcp get chrome-devtools`) is
- * belt-and-braces for the case where a hostile URL is opened in the main
+ * so logins survive across runs. `CDM_EXCLUDE_URL_PATTERNS` in ~/.cursor/mcp.json
+ * is belt-and-braces for the case where a hostile URL is opened in the main
  * automation Chrome by accident.
- *
- * Unlike the main automation Chrome, this one does not need launchd. It is
- * spawned with `detached: true`, which makes it a process-group leader via
- * setsid, so tearing down the calling shell's process group does not reach it.
- * `nohup` in the main launcher only ignores SIGHUP and cannot survive that —
- * which is exactly why that one is given to launchd instead.
  *
  * USAGE
  *   stealth-cdp status                  Show browser state and current tab
@@ -76,8 +69,6 @@
  * ENV
  *   STEALTH_CHROME_PORT     CDP port for the stealth browser (default 9334)
  *   STEALTH_CHROME_PROFILE  Profile directory for the stealth browser
- *   AUTOMATION_CHROME_HOME  Runtime dir for state/screenshots
- *                           (default ~/.automation-chrome)
  */
 
 import { spawn } from 'node:child_process';
@@ -90,9 +81,7 @@ const CHROME_BIN = '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome
 const PROFILE_DIR =
   process.env.STEALTH_CHROME_PROFILE ||
   path.join(os.homedir(), 'Library', 'Application Support', 'Google', 'Chrome', 'CursorStealth');
-const RUNTIME_DIR =
-  process.env.AUTOMATION_CHROME_HOME || path.join(os.homedir(), '.automation-chrome');
-const STATE_FILE = path.join(RUNTIME_DIR, 'stealth-target.json');
+const STATE_FILE = path.join(os.homedir(), '.cursor', 'mcp-wrappers', 'stealth-target.json');
 
 const [cmd, ...args] = process.argv.slice(2);
 if (!cmd || cmd === '-h' || cmd === '--help') {
@@ -533,7 +522,8 @@ try {
 
     case 'shot': {
       const { sessionId } = await resolveTarget();
-      const out = args[0] || path.join(RUNTIME_DIR, 'stealth-shot.png');
+      const out =
+        args[0] || path.join(os.homedir(), '.cursor', 'mcp-wrappers', 'stealth-shot.png');
       const { data } = await send('Page.captureScreenshot', { format: 'png' }, sessionId);
       fs.mkdirSync(path.dirname(out), { recursive: true });
       fs.writeFileSync(out, Buffer.from(data, 'base64'));

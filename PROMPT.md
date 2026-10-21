@@ -10,7 +10,7 @@ always-running Google Chrome that AI agents drive over the Chrome DevTools
 Protocol, supervised by launchd and wired into both Claude Code and Cursor
 through the `chrome-devtools` MCP server.
 
-Everything you need is in this private repo:
+Everything you need is in this repo:
 
     https://github.com/vicks1008/automation-chrome
 
@@ -59,9 +59,18 @@ fix the failure without breaking them:
 - **The listening port is the only evidence.** Never conclude Chrome is up from
   a launch message or from a health check run in the same second. Confirm
   `http://127.0.0.1:9333/json/version` still answers several seconds later.
-- **`chrome-devtools-mcp` stays pinned locally** in
-  `~/.automation-chrome/node_modules`. The wrapper resolves it with
-  `createRequire` from its own directory and cannot see a global `npm i -g`.
+- **The focus guard owns the public port.** Chrome listens internally on 9335;
+  the `focus-guard` proxy (launchd job `com.local.automation-chrome-focus-guard`)
+  serves 9333 and strips the CDP commands that steal macOS focus. Everything
+  talks to 9333. Chrome must own 9335 before the guard binds 9333, so install
+  and start Chrome first. If `http://127.0.0.1:9333/focus-guard/health` is silent
+  but something answers on 9333, a raw Chrome is squatting the port and focus
+  stealing will return. Raise the window for a human only with
+  `automation-chrome-focus`, which talks straight to 9335.
+- **`chrome-devtools-mcp` and `ws` stay pinned locally** in
+  `~/.cursor/mcp-wrappers/node_modules`. The wrapper, the guard, and the focus
+  command all resolve them with `createRequire` and cannot see a global
+  `npm i -g`.
 - **Port 9333, not 9222.** 9222 is commonly squatted by a main Chrome that
   answers slowly or not at all.
 - **The MCP's browser connection is lazy.** Flag-gated tools only register after

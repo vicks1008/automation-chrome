@@ -2,13 +2,7 @@
 #
 # automation-chrome-sync-cookies — copy cookies / local storage from your
 # main Chrome profile into the automation profile so you don't have to log
-# into everything twice.
-#
-# READ THIS FIRST: do not use it on sites behind bot management (Akamai,
-# Kasada, DataDome). Their cookies are bound to the fingerprint of the
-# browser that minted them, so replaying them from another instance looks
-# like cookie theft and actively causes blocks. Log in inside the automation
-# window instead. See README, "Bot detection".
+# into Salesforce / ResMan / Razz / Asana twice.
 #
 # Safe tradeoffs:
 #   * SQLite stores (Cookies, Login Data, Web Data, History) are copied via
@@ -46,7 +40,6 @@ SRC_NAME="${SRC_NAME:-Default}"
 
 SRC="$HOME/Library/Application Support/Google/Chrome/$SRC_NAME"
 DST="$HOME/Library/Application Support/Google/Chrome/CursorAutomation/Default"
-LABEL="com.local.automation-chrome"
 
 if [[ ! -d "$SRC" ]]; then
   echo "[sync] ERROR: source profile not found: $SRC" >&2
@@ -114,15 +107,15 @@ if [[ ${#SYNC_FAILURES[@]} -gt 0 ]]; then
   echo
   echo "[sync] NOTE: these DBs were locked by main Chrome and skipped:"
   for db in "${SYNC_FAILURES[@]}"; do echo "        - $db"; done
-  echo "       Cookies is the only one that matters for web sessions. If you"
-  echo "       specifically need 'Login Data' (saved passwords) or 'History',"
-  echo "       quit main Chrome and re-run this script."
+  echo "       Cookies is the only one that matters for web sessions, and"
+  echo "       Cookies copied successfully. If you specifically need 'Login"
+  echo "       Data' (saved passwords) or 'History', quit main Chrome and"
+  echo "       re-run this script."
 fi
 
 echo
 echo "[sync] done."
-echo "[sync] Relaunching automation Chrome via launchd..."
-launchctl kickstart -k "gui/$(id -u)/$LABEL" 2>/dev/null \
-  || "$(dirname "$0")/automation-chrome"
+echo "[sync] Relaunching automation Chrome..."
+"$(dirname "$0")/automation-chrome"
 echo "[sync] visit your authenticated sites in the automation Chrome window"
 echo "       to confirm sessions carried over."

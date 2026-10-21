@@ -10,7 +10,14 @@ cd ~/Development/automation-chrome
 ./install.sh
 ```
 
-Re-running `install.sh` is the supported way to apply any change.
+`install.sh` installs the launcher, the focus guard, both LaunchAgents, the
+pinned MCP, and the generic `automation-chrome` skill, then starts Chrome (9335)
+and the guard (9333) in that order and verifies the result. Re-running it is the
+supported way to apply any change; `--force` overwrites an existing install
+(required on the machine that authors this bundle). Afterwards, reload your MCP
+client so it picks up the server (Cursor: reload the window; Claude Code: new
+session, then `/mcp`).
+
 `PROMPT.md` holds the master prompt for setting this up on a new machine with
 an AI agent driving.
 
@@ -32,54 +39,64 @@ Pointing `chrome-devtools-mcp` at your main Chrome creates a flaky loop:
 ## Architecture
 
 ```
-┌────────────────────────────────────────────────────────────────────┐
-│  macOS login                                                       │
-│     │                                                              │
-│     ▼                                                              │
-│  launchd (com.local.automation-chrome)  ← ~/Library/LaunchAgents/  │
-│     │                                                              │
-│     ▼                                                              │
-│  automation-chrome  ─── execs ──►  Google Chrome                   │
-│                                    --user-data-dir=CursorAutomation│
-│                                    --remote-debugging-port=9333    │
-│                                    (visible window, clean tabs)    │
-│                                       ▲                            │
-│  Cursor ─┐                            │                            │
-│          ├─ spawns ─► chrome-devtools-mcp-filtered.mjs ────────────┘
-│  Claude ─┘             (wrapper: target filtering + logging)       │
-│                        --browserUrl http://127.0.0.1:9333          │
-│                                                                    │
-│  stealth-cdp ─── spawns on demand ──►  Google Chrome               │
-│  (raw CDP, no Runtime.enable)          --user-data-dir=CursorStealth
-│                                        --remote-debugging-port=9334│
-│                                        (invisible to the MCP)      │
-└────────────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────────┐
+│  macOS login                                                         │
+│     │                                                                │
+│     ├─ launchd (com.local.automation-chrome)                        │
+│     │     └─ automation-chrome ── execs ─► Google Chrome             │
+│     │                               --user-data-dir=CursorAutomation │
+│     │                               --remote-debugging-port=9335     │ (internal)
+│     │                                        ▲                       │
+│     └─ launchd (com.local.automation-chrome-focus-guard)            │ 9335
+│           └─ focus-guard.mjs ──────────────┘                        │
+│                 listens on 9333 (public); strips focus-stealing CDP  │
+│                      ▲                                               │
+│  Cursor ─┐          │ http://127.0.0.1:9333                         │
+│          ├─ spawns ─► chrome-devtools-mcp-filtered.mjs ──────────────┘
+│  Claude ─┘             (wrapper: target filtering + logging)         │
+│                                                                      │
+│  automation-chrome-focus ─ talks straight to 9335 ─► deliberate raise│
+│  stealth-cdp ─── spawns on demand ──►  Google Chrome (CursorStealth, │
+│  (raw CDP, no Runtime.enable)          --remote-debugging-port=9334) │
+└──────────────────────────────────────────────────────────────────────┘
 ```
 
-Port **9333**, not 9222: a main Chrome previously launched with
-`--remote-debugging-port` squats 9222 on IPv4 and answers slowly or not at all.
-Separate ports mean the MCP only ever talks to the clean profile.
+Three fixed ports: **9333** the focus-guard proxy (public — everything talks to
+it), **9335** Chrome itself (internal), **9334** the on-demand stealth Chrome.
+9333 rather than 9222 because a main Chrome previously launched with
+`--remote-debugging-port` squats 9222 and answers slowly or not at all.
+
+The focus guard (`focus-guard.mjs`, launchd job
+`com.local.automation-chrome-focus-guard`) is what keeps the automation Chrome
+from stealing macOS keyboard focus: it neutralises `Target.createTarget` in the
+foreground, `Page.bringToFront`, and `Target.activateTarget`, so new pages open
+as inactive background windows that still render. Chrome must own 9335 before the
+guard binds 9333, so `install.sh` starts Chrome first. To raise the window for a
+genuine human hand-off (a login or MFA), use `automation-chrome-focus`, which
+talks straight to 9335.
 
 ## Layout
 
 | Path | Role |
 | ---- | ---- |
-| `~/.local/bin/automation-chrome` | Launches the dedicated Chrome. Idempotent. `AUTOMATION_CHROME_FOREGROUND=1` for launchd. |
-| `~/.local/bin/automation-chrome-health` | Verifies port 9333, `/json/version`, target count, MCP processes. |
-| `~/.local/bin/automation-chrome-reset` | Kills wedged MCPs and restarts Chrome through launchd. |
+| `~/.local/bin/automation-chrome` | Launches the dedicated Chrome on internal port 9335. Idempotent. `AUTOMATION_CHROME_FOREGROUND=1` for launchd. |
+| `~/.local/bin/automation-chrome-focus` | The only sanctioned window raise (talks straight to Chrome on 9335), for a human login/MFA. |
+| `~/.local/bin/automation-chrome-health` | Verifies Chrome on 9335 and the focus guard on 9333. |
+| `~/.local/bin/automation-chrome-reset` | Restarts Chrome through launchd, then health-checks. |
 | `~/.local/bin/automation-chrome-sync-cookies` | Hot-copies Cookies + Local Storage from the main profile. **Not for bot-managed sites** — see below. |
 | `~/.local/bin/stealth-cdp` | Drives a page over raw CDP without `Runtime.enable`, in its own Chrome on port 9334. For bot-protected sites. |
-| `~/Library/LaunchAgents/com.local.automation-chrome.plist` | Starts at login, restarts on crash (not on clean quit). |
-| `~/.automation-chrome/` | Runtime dir: MCP wrapper, pinned `node_modules`, logs, resolved flag set. |
-| `~/.automation-chrome/chrome-devtools-mcp-filtered.mjs` | Wrapper that monkey-patches `puppeteer.connect` for target filtering. |
-| `~/.automation-chrome/mcp-args.json` | The resolved MCP flag set. Written by the installer; read by `verify.sh`. |
-| `~/.automation-chrome/probe-mcp.mjs` | Boots the MCP with a candidate flag set and reports the tool surface. |
-| `~/.automation-chrome/gd-cookies.mjs` | Lists/clears bot-management cookies and storage for a domain, over CDP. |
-| `~/.automation-chrome/kasada-ab-test.mjs` | A/B harness: measures which CDP domains trip a site's bot detection. |
-| `~/.automation-chrome/stealth-target.json` | Which tab `stealth-cdp` is currently driving. |
+| `~/Library/LaunchAgents/com.local.automation-chrome.plist` | Chrome (9335). Starts at login, restarts on crash (not on clean quit). |
+| `~/Library/LaunchAgents/com.local.automation-chrome-focus-guard.plist` | Focus guard (9333). Always restarts. |
+| `~/.cursor/mcp-wrappers/` | Runtime dir: MCP wrapper, focus guard, pinned `node_modules` (incl. `ws`), logs, resolved flag set. |
+| `~/.cursor/mcp-wrappers/chrome-devtools-mcp-filtered.mjs` | Wrapper that monkey-patches `puppeteer.connect` for target filtering. |
+| `~/.cursor/mcp-wrappers/focus-guard.mjs` | The CDP proxy that serves 9333 and forwards to Chrome on 9335, stripping focus-stealing commands. |
+| `~/.cursor/mcp-wrappers/mcp-args.json` | The resolved MCP flag set. Written by the installer; read by `verify.sh`. |
+| `~/.cursor/mcp-wrappers/probe-mcp.mjs` | Boots the MCP with a candidate flag set and reports the tool surface. |
+| `~/.cursor/mcp-wrappers/gd-cookies.mjs` | Lists/clears bot-management cookies and storage for a domain, over CDP. |
+| `~/.cursor/mcp-wrappers/kasada-ab-test.mjs` | A/B harness: measures which CDP domains trip a site's bot detection. |
 | `~/Library/Application Support/Google/Chrome/CursorAutomation/` | The dedicated profile. Created on first launch; logins persist. |
 | `~/Library/Application Support/Google/Chrome/CursorStealth/` | Profile for the stealth Chrome (port 9334). Logins persist here too. |
-| `~/.claude/skills/automation-chrome/`, `~/.cursor/skills/automation-chrome/` | The skill, so agents know how to operate this. |
+| `~/.claude/skills/automation-chrome/`, `~/.cursor/skills/automation-chrome/` | The generic browser-automation skill, so agents know how to operate this. (The MyRazz-specific skill is not shipped in this public repo.) |
 
 The profile keeps the name `CursorAutomation` even on a Claude-only machine:
 `pgrep -f "user-data-dir=.*CursorAutomation"` is baked into every script and the
@@ -91,11 +108,13 @@ Nothing to do. Chrome is always running and the MCP connects automatically.
 Look for the Chrome window whose profile pill reads `CursorAutomation`.
 
 ```bash
-automation-chrome-health         # is everything alive?
-automation-chrome-reset          # kill wedged MCP + restart Chrome if down
-automation-chrome-sync-cookies   # re-pull sessions from main Chrome
-stealth-cdp status               # is the bot-safe Chrome (9334) up, what tab?
-./verify.sh                      # full end-to-end check incl. MCP tool count
+automation-chrome-health              # Chrome (9335) + focus guard (9333)
+automation-chrome-focus [id|url]      # raise the window for a human login/MFA
+automation-chrome-reset               # restart Chrome via launchd, then health
+automation-chrome-sync-cookies        # re-pull sessions from main Chrome
+stealth-cdp status                    # is the bot-safe Chrome (9334) up, what tab?
+curl -s http://127.0.0.1:9333/focus-guard/health
+./verify.sh                           # full end-to-end check incl. MCP tool count
 ```
 
 If a session expires, just log in once inside the automation window — the
@@ -103,7 +122,7 @@ profile survives launchd restarts.
 
 ## Enabled tool categories
 
-The installer passes these so the full DevTools-for-agents surface (~51 tools)
+The installer passes these so the full DevTools-for-agents surface (~55 tools)
 is exposed rather than the core defaults:
 
 | Flag | Adds |
@@ -172,8 +191,8 @@ Kasada-protected login, identical profile/machine/IP:
 Reproduce it on any Kasada-protected login:
 
 ```bash
-node ~/.automation-chrome/kasada-ab-test.mjs --username=you@example.com --variant=clean    # expect 200
-node ~/.automation-chrome/kasada-ab-test.mjs --username=you@example.com --variant=runtime  # expect 429
+node ~/.cursor/mcp-wrappers/kasada-ab-test.mjs --username=you@example.com --variant=clean    # expect 200
+node ~/.cursor/mcp-wrappers/kasada-ab-test.mjs --username=you@example.com --variant=runtime  # expect 429
 ```
 
 ### Two mitigations, applied together
@@ -188,7 +207,7 @@ stderr, which needs `CDM_PATCH_LOG=1` (the installer sets it). To add origins:
 claude mcp remove chrome-devtools --scope user
 claude mcp add chrome-devtools --scope user \
   -e CDM_PATCH_LOG=1 -e CDM_EXCLUDE_URL_PATTERNS=godaddy.com,example.com \
-  -- node $(node -p 'JSON.parse(require("fs").readFileSync(process.env.HOME+"/.automation-chrome/mcp-args.json","utf8")).join(" ")')
+  -- node $(node -p 'JSON.parse(require("fs").readFileSync(process.env.HOME+"/.cursor/mcp-wrappers/mcp-args.json","utf8")).join(" ")')
 ```
 
 For Cursor, add the same key to `env` in `~/.cursor/mcp.json`.
@@ -266,8 +285,8 @@ whose second `~`-delimited field is `0` rather than `-1` is already marked bad.
 Log in inside the automation window instead. To inspect or reset them:
 
 ```bash
-node ~/.automation-chrome/gd-cookies.mjs list  godaddy   # flags [BOT-MGMT] entries
-node ~/.automation-chrome/gd-cookies.mjs clear godaddy   # cookies + local storage + IDB
+node ~/.cursor/mcp-wrappers/gd-cookies.mjs list  godaddy   # flags [BOT-MGMT] entries
+node ~/.cursor/mcp-wrappers/gd-cookies.mjs clear godaddy   # cookies + local storage + IDB
 ```
 
 Despite the name it takes any domain substring, and
@@ -282,12 +301,12 @@ accessible name.
 
 ## Upgrading chrome-devtools-mcp
 
-The wrapper resolves the package from `~/.automation-chrome/node_modules` via
+The wrapper resolves the package from `~/.cursor/mcp-wrappers/node_modules` via
 `createRequire`, which **cannot see globally-installed packages** — `npm i -g`
 has no effect here.
 
 ```bash
-cd ~/.automation-chrome
+cd ~/.cursor/mcp-wrappers
 npm install chrome-devtools-mcp@latest
 
 # confirm the flag names still exist
@@ -303,11 +322,19 @@ Then bump the pin in `mcp/package.json` in this repo so a fresh install matches.
 
 ## LaunchAgent management
 
+There are two jobs. Chrome (9335) must be up before the guard (9333) binds and
+proxies to it, so start Chrome first.
+
 ```bash
+# Chrome (internal 9335)
 launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.local.automation-chrome.plist
-launchctl bootout   gui/$(id -u)/com.local.automation-chrome     # stop until next login
-launchctl kickstart -k gui/$(id -u)/com.local.automation-chrome  # force restart now
-launchctl print     gui/$(id -u)/com.local.automation-chrome     # status
+launchctl kickstart -k gui/$(id -u)/com.local.automation-chrome
+# Focus guard (public 9333)
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.local.automation-chrome-focus-guard.plist
+launchctl kickstart -k gui/$(id -u)/com.local.automation-chrome-focus-guard
+
+launchctl bootout gui/$(id -u)/com.local.automation-chrome              # stop Chrome until next login
+launchctl print   gui/$(id -u)/com.local.automation-chrome-focus-guard  # status
 ```
 
 ## Troubleshooting
@@ -317,14 +344,17 @@ Cursor: reload the window, or toggle the server in Settings → Features → MCP
 Claude Code: start a new session and run `/mcp`.
 
 **Chrome keeps relaunching unexpectedly.** Check
-`~/.automation-chrome/automation-chrome.launchd.err.log`. If Chrome exits
+`~/.cursor/mcp-wrappers/automation-chrome.launchd.err.log`. If Chrome exits
 non-zero, `KeepAlive.Crashed=true` restarts it.
 
 **You want it gone temporarily.** Quit the window normally. Because
 `SuccessfulExit=false`, launchd won't resurrect it until next login.
 
-**Port 9333 collides with another tool.** Re-run `./install.sh --port 9444`,
-which updates the agent and both client configs together.
+**Port 9333 or 9335 collides with another tool.** The ports are fixed in the
+scripts, the plists, and `mcp.json`. To move them, set `FOCUS_GUARD_LISTEN_PORT`
+/ `FOCUS_GUARD_CHROME_PORT` in the guard plist and `AUTOMATION_CHROME_PORT` in
+the Chrome plist, and update `--browserUrl` in `mcp.json` to match the new public
+port, then re-run `./install.sh --force`.
 
 **A site says "your browser is unusual" / "enable JavaScript" / "disable your
 VPN".** That is bot management, not a real browser problem. Confirm by checking
@@ -343,7 +373,7 @@ blocked on most consumer networks, and CDN challenge pages return 403 to any
 request without a browser User-Agent. Both look exactly like an outage. Test a
 known-good control host first.
 
-**Logs.** `~/.automation-chrome/` holds `automation-chrome.log` (manual
+**Logs.** `~/.cursor/mcp-wrappers/` holds `automation-chrome.log` (manual
 launches), `automation-chrome.launchd.{out,err}.log`, and
 `chrome-devtools-mcp.log`. The MCP protocol log records full CDP traffic
 including form submissions, so `automation-chrome` rotates anything over 32MB to
