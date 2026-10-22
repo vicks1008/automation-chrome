@@ -8,10 +8,13 @@
  */
 
 import { spawn } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
 
 const flags = process.argv.slice(2);
 const child = spawn('node', ['./chrome-devtools-mcp-filtered.mjs', ...flags], {
-  cwd: new URL('.', import.meta.url).pathname,
+  // fileURLToPath, not URL.pathname: on Windows the pathname is "/C:/..." which
+  // is not a valid working directory.
+  cwd: fileURLToPath(new URL('.', import.meta.url)),
   stdio: ['pipe', 'pipe', 'pipe'],
 });
 

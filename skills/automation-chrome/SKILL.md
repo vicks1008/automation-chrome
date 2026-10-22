@@ -54,6 +54,19 @@ If kickstart reports the service is not loaded:
 launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.local.automation-chrome.plist
 ```
 
+**Reloading a changed plist: `bootout` is asynchronous.** To pick up an edited
+plist you must `bootout` then `bootstrap`, but bootstrapping immediately after
+bootout fails with `Bootstrap failed: 5: Input/output error` (errno 5) because
+the label has not finished unloading. Worse, the job is left *booted out* (Chrome
+down) while the script dies on `set -e`. Wait for the label to disappear first:
+
+```bash
+launchctl bootout gui/$(id -u)/com.local.automation-chrome 2>/dev/null || true
+for _ in $(seq 1 40); do launchctl print gui/$(id -u)/com.local.automation-chrome >/dev/null 2>&1 || break; sleep 0.25; done
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.local.automation-chrome.plist
+launchctl kickstart -k gui/$(id -u)/com.local.automation-chrome
+```
+
 ## Verify the port, not the launch message
 
 ```bash
@@ -170,6 +183,24 @@ These hold for any site driven through this browser:
   `page.evaluate(() => window.__x)`. Run that script from inside the project
   (e.g. `web/scripts/`), not `/tmp`, or `playwright` and the app's modules won't
   resolve.
+- **To automate a site far more cheaply than clicking its UI, call its private
+  JSON API in-page.** Map it first (devtools network capture + REA), then run the
+  real request *inside the signed-in page* with
+  `page.evaluate(() => fetch(url, { credentials: 'include', headers: {...} }))`.
+  The HttpOnly session cookies ride along automatically — no token extraction, no
+  re-auth. Supply only the non-cookie secrets a write needs (a CSRF/anti-forgery
+  token is almost always a JS-readable `window.*` global, e.g.
+  `window.OfficeFormServerInfo.antiForgeryToken`; read it *fresh per call*, as it
+  can rotate). Use `location.origin` as the base so same-origin cookie scoping
+  holds. This collapsed a MS Forms copy from dozens of DOM actions + 60s polling
+  to ~5 API calls in ~2.5s.
+- **To measure one operation's real API cost, don't trust a blanket
+  `page.on('request')` count** filtered only by URL prefix: a live SPA fires its
+  own background GETs on the shared page, inflating the number (37 "formapi" GETs
+  where the operation made 3). The clean signal is the operation's distinctive
+  verbs/endpoints (a `POST`/`PATCH` to a specific path), not raw GET totals.
+  `connectOverCDP` + `browser.close()` just *detaches* — it never kills the
+  managed Chrome — so it is safe to count against the live session and clean up.
 - **A site behind SSO or a passkey/MFA wall needs a human hand-off.** When a
   login can only be completed by the person (SSO password, an MFA code, a
   passkey enrollment the automation account can't do), raise the window with
@@ -223,6 +254,19 @@ These hold for any site driven through this browser:
   opens in its own window (not a background *tab*) and the anti-backgrounding
   flags keep it painting, so capture it where it is. `Page.bringToFront` is
   blocked by the guard and would not help anyway.
+- **Bulk visual survey of many sites (compare templates, audit lookalikes):** a
+  Node script run from inside the repo using
+  `chromium.connectOverCDP('http://127.0.0.1:9333')` and
+  `ctx.newPage()` per site beats MCP clicking. Import playwright-core by its
+  absolute `node_modules/.pnpm/playwright-core@*/node_modules/playwright-core/index.mjs`
+  path (pnpm doesn't hoist it, so a bare import fails with ERR_MODULE_NOT_FOUND).
+  Per site: `setViewportSize` 1440x900, scroll 800 px steps with ~1.1 s waits,
+  save JPEGs, read nav links from `header,nav` and fonts/colors via
+  `getComputedStyle`, then tile with
+  `ffmpeg -start_number 0 -i "<site>-home-%d.jpg" -vf "scale=640:-1,tile=3x2" -frames:v 1 sheet.jpg`
+  (`-pattern_type glob` with `[0-4]` fails) and view one sheet per site. About
+  30 s per site; run 13 sites in one foreground call with a 10 min block.
+  Delete the script afterward so it isn't committed.
 - **Other agent sessions share this browser and its "selected page".** With
   `--no-page-id-routing`, another session opening or selecting a tab silently
   redirects your next MCP call (screenshots and scripts run on the wrong site).
@@ -235,6 +279,35 @@ These hold for any site driven through this browser:
 
 For the MyRazz dashboard, also use the `razz-website-editor-automation` skill
 and its `references/editor-behaviors.md`.
+
+## On Windows
+
+The same stack runs on Windows 10/11 with the same ports (9333 guard, 9335
+Chrome). Only the supervision and the commands differ. Installed by
+`windows\install.ps1` in the automation-chrome repo. These notes are not yet
+verified on a real Windows machine; correct them from experience.
+
+- **No launchd.** A supervisor (`%USERPROFILE%\.local\bin\automation-chrome-supervise.ps1`)
+  keeps Chrome and the guard alive. It is started at logon by the scheduled
+  tasks `\AutomationChrome\Chrome` and `\AutomationChrome\FocusGuard`, or by
+  `AutomationChrome-*.lnk` shortcuts in the Startup folder if tasks could not be
+  created (`supervisor` in `%USERPROFILE%\.cursor\mcp-wrappers\automation-chrome.windows.json`).
+- **Restart with `automation-chrome-reset`, never by running `chrome.exe`.** A
+  hand-started Chrome isn't supervised; the supervisor just watches the port
+  until it dies. As on macOS, a clean quit leaves Chrome down until reset.
+- **Commands:** `automation-chrome-health`, `automation-chrome-reset`,
+  `automation-chrome-focus [id|url]` (`.cmd` shims in `%USERPROFILE%\.local\bin`).
+  Windows can refuse to let a background process take focus; then the taskbar
+  button flashes and the user must click it.
+- **Use `curl.exe`, not `curl`, in Windows PowerShell 5.1.** There `curl` is an
+  alias for `Invoke-WebRequest` and rejects curl flags. Or use
+  `Invoke-RestMethod -UseBasicParsing`.
+- **Paths:** runtime and logs in `%USERPROFILE%\.cursor\mcp-wrappers`
+  (`supervise-chrome.log`, `supervise-guard.log`, `focus-guard.err.log`); profile
+  in `%LOCALAPPDATA%\Google\Chrome\CursorAutomation`.
+- **Not available on Windows:** `stealth-cdp` and `automation-chrome-sync-cookies`.
+- **Verify:** `powershell -ExecutionPolicy Bypass -File windows\verify.ps1` in the
+  automation-chrome checkout.
 
 ## Session learning loop
 
@@ -296,6 +369,15 @@ launchctl print gui/$(id -u)/com.local.automation-chrome-focus-guard | rg -i 'st
 
 If `/focus-guard/health` is silent but something is on 9333, a stale raw Chrome
 may be bound there instead of the guard — the symptom is focus-stealing returning.
+
+The opposite case: health is green, but `launchctl print` shows the guard job
+with `state = spawn scheduled`, no `pid`, a high `runs` count, and
+`last exit code = 1` (the err log ends in `EADDRINUSE ... port: 9333`). An
+orphaned guard (`ps -o ppid` = 1, left behind by an earlier bootout/reload) holds
+the port, and launchd's copy crash-loops every 10 s. Everything appears to work.
+Fix: confirm the pid from `lsof -nP -iTCP:9333 -sTCP:LISTEN` differs from the
+job's pid, `kill` it, and KeepAlive respawns the managed copy within seconds.
+After any guard reload, check that the job pid and the port owner match.
 The guard's `webSocketDebuggerUrl` from `/json/version` must report `:9333`
 (rewritten), proving responses are being proxied, not served by Chrome directly.
 

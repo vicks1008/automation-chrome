@@ -18,6 +18,26 @@ supported way to apply any change; `--force` overwrites an existing install
 client so it picks up the server (Cursor: reload the window; Claude Code: new
 session, then `/mcp`).
 
+### Windows 10/11
+
+```powershell
+git clone https://github.com/vicks1008/automation-chrome.git $env:USERPROFILE\Development\automation-chrome
+cd $env:USERPROFILE\Development\automation-chrome
+powershell -NoProfile -ExecutionPolicy Bypass -File windows\install.ps1
+```
+
+[`windows/install.ps1`](windows/install.ps1) builds the same stack with the same
+ports. Without launchd, a small supervisor
+([`windows/bin/automation-chrome-supervise.ps1`](windows/bin/automation-chrome-supervise.ps1))
+keeps Chrome and the guard alive. Scheduled tasks under `\AutomationChrome\`
+start it at logon; if the account can't create tasks, Startup-folder shortcuts
+are used instead. No admin rights are needed. Commands are
+`automation-chrome-health`, `automation-chrome-reset`, and
+`automation-chrome-focus`. [`windows/verify.ps1`](windows/verify.ps1) runs the
+same checks as `verify.sh`. `stealth-cdp` and `automation-chrome-sync-cookies`
+are macOS-only for now. The Windows scripts target Windows PowerShell 5.1, which
+every Windows 10/11 install has.
+
 `PROMPT.md` holds the master prompt for setting this up on a new machine with
 an AI agent driving.
 
