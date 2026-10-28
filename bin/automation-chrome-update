@@ -1,0 +1,7 @@
+#!/bin/bash
+# Run the guarded updater now. Same as the scheduled run; accepts
+# --dry-run (report only), --force (ignore "already done today"), --min-idle <s>.
+# Log: ~/Library/Logs/automation-chrome-update.log
+dir="$(cat "$HOME/.cursor/mcp-wrappers/bundle-dir" 2>/dev/null)"
+[ -f "$dir/mcp/update.mjs" ] || { echo "bundle dir not recorded; re-run install.sh in the automation-chrome checkout" >&2; exit 1; }
+exec node "$dir/mcp/update.mjs" "$@"

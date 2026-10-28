@@ -1,0 +1,47 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.local.automation-chrome-update</string>
+
+  <!--
+    Daily guarded updater (see mcp/update.mjs). launchd wakes it at login and
+    every hour; the first complete pass of each day does the work and later
+    wake-ups exit at once, unless something is still pending (for example a
+    Chrome restart waiting for agents to go idle). A laptop that was asleep at
+    a scheduled time simply runs on the next wake-up.
+
+    __HOME__, __NODE__ and __BUNDLE__ are substituted by install.sh. Edit the
+    template and re-run `install.sh --update`, not this file.
+  -->
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>__NODE__</string>
+    <string>__BUNDLE__/mcp/update.mjs</string>
+  </array>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+  </dict>
+
+  <key>RunAtLoad</key>
+  <true/>
+  <key>StartInterval</key>
+  <integer>3600</integer>
+
+  <!-- Never compete with the user's work for CPU. -->
+  <key>ProcessType</key>
+  <string>Background</string>
+  <key>LowPriorityIO</key>
+  <true/>
+
+  <key>StandardOutPath</key>
+  <string>__HOME__/.cursor/mcp-wrappers/update.launchd.out.log</string>
+  <key>StandardErrorPath</key>
+  <string>__HOME__/.cursor/mcp-wrappers/update.launchd.err.log</string>
+</dict>
+</plist>

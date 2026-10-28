@@ -16,6 +16,11 @@
 #   ./install.sh --no-cursor     # skip Cursor MCP + skill registration
 #   ./install.sh --no-claude     # skip Claude Code MCP + skill registration
 #   ./install.sh --force         # overwrite the live install / existing skills
+#   ./install.sh --update        # refresh scripts, wrappers and the updater schedule
+#                                # only (what the daily updater runs). Never touches
+#                                # Chrome, skills, mcp.json or the pinned MCP version.
+#   ./install.sh --agent-only    # only the updater command + its LaunchAgent (for the
+#                                # authoring machine, whose live scripts differ on purpose)
 #                                # (required on the machine that authored this bundle)
 
 set -euo pipefail
@@ -35,13 +40,17 @@ CHROME_URL="http://127.0.0.1:$CHROME_PORT"
 DO_CURSOR=1
 DO_CLAUDE=1
 FORCE=0
+UPDATE=0
+AGENT_ONLY=0
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --no-cursor) DO_CURSOR=0; shift ;;
     --no-claude) DO_CLAUDE=0; shift ;;
     --force)     FORCE=1; shift ;;
-    -h|--help)   sed -n '3,20p' "$0"; exit 0 ;;
+    --update)    UPDATE=1; shift ;;
+    --agent-only) UPDATE=1; AGENT_ONLY=1; shift ;;
+    -h|--help)   sed -n '3,26p' "$0"; exit 0 ;;
     *) echo "unknown option: $1" >&2; exit 2 ;;
   esac
 done
@@ -65,6 +74,68 @@ reload_job() {
   launchctl bootstrap "gui/$uid" "$plist"
   launchctl kickstart -k "gui/$uid/$label"
 }
+
+UPDATE_LABEL="com.local.automation-chrome-update"
+UPDATE_PLIST="$LA_DIR/$UPDATE_LABEL.plist"
+
+# Install the daily updater's LaunchAgent (idempotent). Loads it only when the
+# plist changed or it is not loaded, so a routine --update never re-runs it.
+install_update_agent() {
+  local node_bin; node_bin="$(command -v node)"
+  mkdir -p "$LA_DIR" "$RUNTIME_DIR"
+  printf '%s\n' "$REPO_DIR" >"$RUNTIME_DIR/bundle-dir"
+  local tmp; tmp="$(mktemp)"
+  sed -e "s|__HOME__|$HOME|g" -e "s|__NODE__|$node_bin|g" -e "s|__BUNDLE__|$REPO_DIR|g" \
+    "$REPO_DIR/launchd/$UPDATE_LABEL.plist.template" >"$tmp"
+  if ! cmp -s "$tmp" "$UPDATE_PLIST" || ! launchctl print "gui/$(id -u)/$UPDATE_LABEL" >/dev/null 2>&1; then
+    mv "$tmp" "$UPDATE_PLIST"
+    if [[ "${AUTOMATION_CHROME_UPDATER:-}" == "1" ]]; then
+      # Called by the updater itself: reloading would kill the running updater.
+      echo "    $UPDATE_LABEL plist rewritten (takes effect at next login)"
+    else
+      reload_job "$UPDATE_LABEL" "$UPDATE_PLIST"
+      echo "    $UPDATE_LABEL loaded (hourly check, one full pass a day)"
+    fi
+  else
+    rm -f "$tmp"
+    echo "    $UPDATE_LABEL already current"
+  fi
+}
+
+# --update: refresh what the bundle ships, nothing else. The updater runs this
+# after pulling the bundle. It does not restart Chrome, rewrite mcp.json, touch
+# skills, or change the pinned chrome-devtools-mcp (the updater gates that).
+if [[ $UPDATE -eq 1 ]]; then
+  command -v node >/dev/null 2>&1 || die "node not found."
+  if [[ $AGENT_ONLY -eq 1 ]]; then
+    say "Installing the updater command and schedule only"
+    mkdir -p "$BIN_DIR"
+    install -m 0755 "$REPO_DIR/bin/automation-chrome-update" "$BIN_DIR/automation-chrome-update"
+    install_update_agent
+    exit 0
+  fi
+  say "Refreshing installed scripts (update mode)"
+  mkdir -p "$BIN_DIR" "$RUNTIME_DIR"
+  for f in "$REPO_DIR"/bin/*; do
+    install -m 0755 "$f" "$BIN_DIR/$(basename "$f")"
+  done
+  GUARD_CHANGED=0
+  cmp -s "$REPO_DIR/mcp/focus-guard.mjs" "$RUNTIME_DIR/focus-guard.mjs" || GUARD_CHANGED=1
+  for f in chrome-devtools-mcp-filtered.mjs focus-guard.mjs probe-mcp.mjs; do
+    install -m 0755 "$REPO_DIR/mcp/$f" "$RUNTIME_DIR/"
+  done
+  for f in "$REPO_DIR"/tools/*.mjs; do
+    install -m 0755 "$f" "$RUNTIME_DIR/$(basename "$f")"
+  done
+  install -m 0644 "$REPO_DIR/README.md" "$RUNTIME_DIR/README.md"
+  if [[ $GUARD_CHANGED -eq 1 ]]; then
+    say "Focus guard changed; restarting it (Chrome is left running)"
+    reload_job "$GUARD_LABEL" "$GUARD_PLIST"
+  fi
+  install_update_agent
+  say "Done (update mode)"
+  exit 0
+fi
 
 # ---------------------------------------------------------------- preflight
 
@@ -194,7 +265,6 @@ MCP_ARGS+=(
   "--categoryExperimentalWebmcp=true"
   "--categoryExtensions=true"
   "--allow-unrestricted-paths"
-  "--no-page-id-routing"
   "--no-usage-statistics"
 )
 
@@ -267,6 +337,11 @@ for sk in "$REPO_DIR"/skills/*/; do
 done
 
 install -m 0644 "$REPO_DIR/README.md" "$RUNTIME_DIR/README.md"
+
+# ------------------------------------------------------------------- updater
+
+say "Installing the daily updater"
+install_update_agent
 
 # ------------------------------------------------------------------- verify
 

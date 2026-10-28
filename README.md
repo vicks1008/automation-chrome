@@ -41,6 +41,20 @@ every Windows 10/11 install has.
 `PROMPT.md` holds the master prompt for setting this up on a new machine with
 an AI agent driving.
 
+## Several agents at once, and staying current
+
+- **One tab per session.** The MCP runs with `pageId` routing (do not pass
+  `--no-page-id-routing`), so concurrent chats stay on their own tabs. Each
+  session opens its own tab with `new_page` and passes its `pageId`.
+  `mcp/probe-mcp.mjs` proves the isolation with an interleaved two-tab test.
+- **Daily guarded updater.** `install.sh` schedules `mcp/update.mjs` (launchd
+  `com.local.automation-chrome-update`; on Windows the `\AutomationChrome\Update`
+  task). It pulls this repo, refreshes installed scripts (`install.sh --update`),
+  upgrades `chrome-devtools-mcp` only if its flags still parse and the probe
+  passes (rolls back otherwise), and restarts Chrome onto a newer build only after
+  agents were idle for 15 minutes. Run it now with `automation-chrome-update`
+  (`--dry-run` to preview). Log: `~/Library/Logs/automation-chrome-update.log`.
+
 ## Why a separate Chrome
 
 Pointing `chrome-devtools-mcp` at your main Chrome creates a flaky loop:

@@ -113,7 +113,18 @@ function transformClientFrame(raw) {
 
 const wss = new WebSocketServer({ noServer: true });
 
+// Activity tracking for the daily updater and automation-chrome-health.
+// "Activity" means a client sent a command (WebSocket frame to Chrome) or made
+// an HTTP request other than the health probe. Chrome's own events to an
+// attached-but-idle MCP server do not count, and neither does an open socket:
+// Cursor keeps one open all day.
+let activeClients = 0;
+let lastActivity = Date.now();
+const touch = () => { lastActivity = Date.now(); };
+
 function proxyWebSocket(clientWs, chromeUrl) {
+  activeClients += 1;
+  clientWs.on('close', () => { activeClients -= 1; });
   const chromeWs = new WebSocket(chromeUrl, {
     perMessageDeflate: false,
     maxPayload: 512 * 1024 * 1024,
@@ -147,6 +158,7 @@ function proxyWebSocket(clientWs, chromeUrl) {
   });
 
   clientWs.on('message', (data, isBinary) => {
+    touch();
     if (isBinary) {
       sendToChrome(data, true);
       return;
@@ -273,11 +285,19 @@ async function passThroughHttp(req, res) {
 
 const server = http.createServer(async (req, res) => {
   const url = req.url || '/';
+  if (url !== '/focus-guard/health') touch();
   try {
     // Local health probe for automation-chrome-health.
     if (url === '/focus-guard/health') {
       res.writeHead(200, { 'content-type': 'application/json' });
-      res.end(JSON.stringify({ ok: true, listenPort: LISTEN_PORT, chromePort: CHROME_PORT }));
+      res.end(JSON.stringify({
+        ok: true,
+        listenPort: LISTEN_PORT,
+        chromePort: CHROME_PORT,
+        activeClients,
+        lastActivity,
+        idleSeconds: Math.round((Date.now() - lastActivity) / 1000),
+      }));
       return;
     }
 

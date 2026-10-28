@@ -267,18 +267,33 @@ These hold for any site driven through this browser:
   (`-pattern_type glob` with `[0-4]` fails) and view one sheet per site. About
   30 s per site; run 13 sites in one foreground call with a 10 min block.
   Delete the script afterward so it isn't committed.
-- **Other agent sessions share this browser and its "selected page".** With
-  `--no-page-id-routing`, another session opening or selecting a tab silently
-  redirects your next MCP call (screenshots and scripts run on the wrong site).
-  Guard every script with a `location.host` check. If the selection keeps
-  moving, open your own tab with `curl -s -X PUT "http://127.0.0.1:9333/json/new?<url>"`
-  and drive it by target id over its WebSocket
-  (`ws://127.0.0.1:9333/devtools/page/<id>`: `Runtime.evaluate`,
-  `Page.captureScreenshot`, `Input.dispatchMouseEvent`). Close it afterwards
-  with `/json/close/<id>`.
+- **Other agent sessions share this browser.** `pageId` routing keeps each session on its own tab; follow "Sharing the browser with other sessions" below.
 
 For the MyRazz dashboard, also use the `razz-website-editor-automation` skill
 and its `references/editor-behaviors.md`.
+
+## Sharing the browser with other sessions (one tab per session)
+
+Several chats and agents use this one Chrome, and `pageId` routing is on
+(`--no-page-id-routing` was removed once chrome-devtools-mcp 1.12.0 proved
+concurrent calls stay on their own pages). Every page tool therefore takes a
+`pageId`. Follow this protocol:
+
+1. **Open your own tab** with `new_page`, and note the `pageId` it returns
+   (also visible in `list_pages`). Never reuse a tab you did not open.
+2. **Pass that `pageId` on every call** (`navigate_page`, `evaluate_script`,
+   `take_screenshot`, `click`, ...). `select_page` is not needed.
+3. **Never** navigate, reload, resize, or close a tab you did not open, and never
+   close tabs by URL substring. Close your own by `pageId` when done.
+4. Keep the host guard (`location.host`) in scripts that edit data. It is cheap
+   and catches a wrong id.
+5. A page tool that fails with an unknown `pageId` means the tab was closed
+   (by you, the user, or a "Leave site?" prompt). Open a new one; do not borrow
+   another session's tab.
+
+For raw CDP (a long-running Node script, `Page.navigate` that must skip a
+`beforeunload` prompt), open a tab with `curl -s -X PUT "http://127.0.0.1:9333/json/new?<url>"`
+and drive `ws://127.0.0.1:9333/devtools/page/<id>`; close it with `/json/close/<id>`.
 
 ## On Windows
 
@@ -392,8 +407,9 @@ camelCase-only grep produces a false "removed flag".
 from, so never skip it. Diff defaults between the pinned and target version.
 1.8.0 renamed `--experimentalPageIdRouting` to `--pageIdRouting` *and flipped its
 default to true*, which would have made `pageId` required on every page-scoped
-tool without a single line of config changing. The stack deliberately pins the
-old implicit-selection behaviour with `--no-page-id-routing`.
+tool without a single line of config changing. The stack used to pin the old implicit-selection behaviour with
+`--no-page-id-routing`; it now runs with routing on so concurrent sessions can't
+redirect each other. The interleaved test in `probe-mcp.mjs` proves it on every upgrade.
 
 ```bash
 npx -y chrome-devtools-mcp@latest --help | rg -i 'category|experimental|memory|pageId|unrestricted'
@@ -446,7 +462,7 @@ numbers and version pins have both drifted here before.
 
 ### State as of chrome-devtools-mcp 1.11.0 (verified 2026-10-15)
 
-All flags in `mcp.json` still parse, `--no-page-id-routing` is still honoured,
+All flags in `mcp.json` still parse, `--no-page-id-routing` is still honoured (no longer passed),
 and the probe exposes 55 tools. Two deprecations to act on eventually:
 `--allowUnrestrictedPaths` (use `--workspace=/`) and `--experimentalScreencast`
 plus `--experimentalFfmpegPath` (a built-in ffmpeg-free screencast now ships

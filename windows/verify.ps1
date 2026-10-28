@@ -41,6 +41,10 @@ foreach ($pair in @(@('Chrome', 'chrome'), @('FocusGuard', 'guard'))) {
 }
 
 # 2. Chrome answers on its internal port.
+$updTask = Get-ScheduledTask -TaskPath $TaskPath -TaskName 'Update' -ErrorAction SilentlyContinue
+$updLnk = Join-Path ([Environment]::GetFolderPath('Startup')) 'AutomationChrome-Update.lnk'
+if ($updTask -or (Test-Path $updLnk)) { Pass 'daily updater scheduled' } else { Fail 'daily updater is not scheduled (re-run windows\install.ps1 -Update)' }
+
 if (Get-Json "$ChromeUrl/json/version") { Pass 'Chrome answering on 9335' } else { Fail 'nothing answering on 9335' }
 
 # 3. The focus guard answers its health endpoint (so 9333 is the guard, not a raw Chrome).

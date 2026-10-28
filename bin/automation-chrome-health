@@ -11,4 +11,14 @@ if curl -s --max-time 3 http://127.0.0.1:9333/json/version | grep -q webSocketDe
 else
   echo "guard  (9333): DOWN or upstream error"; rc=1
 fi
+# Tab hygiene: many open pages usually means sessions are leaking tabs.
+# Informational only; nothing is closed automatically.
+pages=$(curl -s --max-time 3 http://127.0.0.1:9333/json/list | grep -c '"type": "page"')
+if [ "${pages:-0}" -gt 15 ]; then
+  echo "tabs         : $pages open (more than 15; sessions may be leaking tabs, close the ones you own by pageId)"
+else
+  echo "tabs         : ${pages:-0} open"
+fi
+idle=$(curl -s --max-time 3 http://127.0.0.1:9333/focus-guard/health | sed -n 's/.*"idleSeconds":\([0-9]*\).*/\1/p')
+[ -n "$idle" ] && echo "agent idle   : ${idle}s since last command"
 exit $rc

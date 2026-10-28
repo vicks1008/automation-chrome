@@ -42,6 +42,14 @@ for L in "$CHROME_LABEL" "$GUARD_LABEL"; do
   fi
 done
 
+# 1b. The daily updater is scheduled (it keeps Chrome and the MCP current).
+if launchctl print "gui/$(id -u)/com.local.automation-chrome-update" >/dev/null 2>&1; then
+  pass "daily updater scheduled (com.local.automation-chrome-update)"
+else
+  fail "daily updater is not scheduled"
+  info "re-run ./install.sh --update"
+fi
+
 # 2. The ports are the only real evidence the processes are alive.
 for P in "$CHROME_PORT" "$PUBLIC_PORT"; do
   if lsof -iTCP:"$P" -sTCP:LISTEN -P -n >/dev/null 2>&1; then

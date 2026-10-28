@@ -10,7 +10,11 @@
 # Idempotent: re-running is the supported way to apply changes.
 #
 # Usage (from the repo root):
-#   powershell -NoProfile -ExecutionPolicy Bypass -File windows\install.ps1 [-NoCursor] [-NoClaude] [-Force]
+#   powershell -NoProfile -ExecutionPolicy Bypass -File windows\install.ps1 [-NoCursor] [-NoClaude] [-Force] [-Update]
+#
+# -Update refreshes the scripts, wrappers and the daily-updater schedule only
+# (what the updater runs after pulling the bundle). It never touches Chrome,
+# skills, mcp.json or the pinned MCP version.
 #
 # Not installed on Windows yet: stealth-cdp and automation-chrome-sync-cookies
 # (both macOS-specific). Windows PowerShell 5.1, ASCII only.
@@ -18,7 +22,8 @@
 param(
   [switch]$NoCursor,
   [switch]$NoClaude,
-  [switch]$Force
+  [switch]$Force,
+  [switch]$Update
 )
 
 $ErrorActionPreference = 'Stop'
@@ -53,6 +58,78 @@ function Stop-Matching([string]$name, [string]$pattern) {
   Get-CimInstance Win32_Process -Filter "Name='$name'" |
     Where-Object { $_.CommandLine -like $pattern } |
     ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+}
+
+# ------------------------------------------------------------ daily updater
+
+# Hourly check, one full pass a day (see mcp\update.mjs). Task Scheduler where
+# allowed, otherwise a Startup-folder shortcut (logon only).
+function Register-UpdateTask {
+  $nodeCmd2 = Get-Command node -ErrorAction SilentlyContinue
+  if (-not $nodeCmd2) { Warn 'node not found; daily updater not scheduled.'; return }
+  Set-Content -Path (Join-Path $Runtime 'bundle-dir') -Value $RepoDir -Encoding ASCII
+  $script = Join-Path $RepoDir 'mcp\update.mjs'
+  $cmdArgs = ('-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -Command "& ''{0}'' ''{1}''"' -f $nodeCmd2.Source, $script)
+  $who = "$env:USERDOMAIN\$env:USERNAME"
+  try {
+    $action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument $cmdArgs
+    $logon = New-ScheduledTaskTrigger -AtLogOn -User $who
+    $daily = New-ScheduledTaskTrigger -Daily -At '07:30'
+    $rep = New-ScheduledTaskTrigger -Once -At '07:30' -RepetitionInterval (New-TimeSpan -Hours 1) -RepetitionDuration (New-TimeSpan -Hours 23)
+    $daily.Repetition = $rep.Repetition
+    $principal = New-ScheduledTaskPrincipal -UserId $who -LogonType Interactive -RunLevel Limited
+    $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
+      -StartWhenAvailable -MultipleInstances IgnoreNew -ExecutionTimeLimit (New-TimeSpan -Hours 1)
+    Register-ScheduledTask -TaskPath $TaskPath -TaskName 'Update' -Action $action -Trigger @($logon, $daily) `
+      -Principal $principal -Settings $settings -Force | Out-Null
+    Info "scheduled task ${TaskPath}Update (hourly check, one full pass a day)"
+  } catch {
+    Warn "could not create the update task ($($_.Exception.Message)); using a Startup-folder shortcut (runs at logon)."
+    $startup = [Environment]::GetFolderPath('Startup')
+    $ws = New-Object -ComObject WScript.Shell
+    $lnk = $ws.CreateShortcut((Join-Path $startup 'AutomationChrome-Update.lnk'))
+    $lnk.TargetPath = Join-Path $env:WINDIR 'System32\WindowsPowerShell\v1.0\powershell.exe'
+    $lnk.Arguments = $cmdArgs
+    $lnk.WindowStyle = 7
+    $lnk.Save()
+    Info 'startup shortcut AutomationChrome-Update.lnk'
+  }
+}
+
+function Install-Commands {
+  New-Item -ItemType Directory -Force -Path $BinDir, $Runtime | Out-Null
+  Copy-Item -Force -Path (Join-Path $PSScriptRoot 'bin\*.ps1') -Destination $BinDir
+  foreach ($cmd in 'automation-chrome-health', 'automation-chrome-reset', 'automation-chrome-focus', 'automation-chrome-update') {
+    $shim = @(
+      '@echo off',
+      ('powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0{0}.ps1" %*' -f $cmd),
+      'exit /b %ERRORLEVEL%'
+    )
+    Set-Content -Path (Join-Path $BinDir "$cmd.cmd") -Value $shim -Encoding ASCII
+    Info $cmd
+  }
+}
+
+if ($Update) {
+  Say 'Refreshing installed scripts (update mode)'
+  if ($env:OS -ne 'Windows_NT') { Die 'Windows only.' }
+  Install-Commands
+  $guardNow = Join-Path $Runtime 'focus-guard.mjs'
+  $guardNew = Join-Path $RepoDir 'mcp\focus-guard.mjs'
+  $guardChanged = (-not (Test-Path $guardNow)) -or ((Get-FileHash $guardNow).Hash -ne (Get-FileHash $guardNew).Hash)
+  foreach ($f in 'chrome-devtools-mcp-filtered.mjs', 'focus-guard.mjs', 'probe-mcp.mjs') {
+    Copy-Item -Force -Path (Join-Path $RepoDir "mcp\$f") -Destination $Runtime
+  }
+  Copy-Item -Force -Path (Join-Path $RepoDir 'tools\*.mjs') -Destination $Runtime
+  Copy-Item -Force -Path (Join-Path $RepoDir 'README.md') -Destination (Join-Path $Runtime 'README.md')
+  if ($guardChanged) {
+    Say 'Focus guard changed; restarting it (Chrome is left running)'
+    # The guard supervisor restarts the process within a few seconds.
+    Stop-Matching 'node.exe' '*focus-guard.mjs*'
+  }
+  Register-UpdateTask
+  Say 'Done (update mode)'
+  exit 0
 }
 
 # ---------------------------------------------------------------- preflight
@@ -98,17 +175,7 @@ Start-Sleep -Seconds 2
 # ------------------------------------------------------------------ scripts
 
 Say "Installing commands to $BinDir"
-New-Item -ItemType Directory -Force -Path $BinDir, $Runtime | Out-Null
-Copy-Item -Force -Path (Join-Path $PSScriptRoot 'bin\*.ps1') -Destination $BinDir
-foreach ($cmd in 'automation-chrome-health', 'automation-chrome-reset', 'automation-chrome-focus') {
-  $shim = @(
-    '@echo off',
-    ('powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0{0}.ps1" %*' -f $cmd),
-    'exit /b %ERRORLEVEL%'
-  )
-  Set-Content -Path (Join-Path $BinDir "$cmd.cmd") -Value $shim -Encoding ASCII
-  Info $cmd
-}
+Install-Commands
 
 $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
 if (-not $userPath) { $userPath = '' }
@@ -213,7 +280,6 @@ $mcpArgs += @(
   '--categoryExperimentalWebmcp=true',
   '--categoryExtensions=true',
   '--allow-unrestricted-paths',
-  '--no-page-id-routing',
   '--no-usage-statistics'
 )
 
@@ -253,6 +319,11 @@ foreach ($sk in Get-ChildItem -Directory -Path (Join-Path $RepoDir 'skills')) {
   }
 }
 Copy-Item -Force -Path (Join-Path $RepoDir 'README.md') -Destination (Join-Path $Runtime 'README.md')
+
+# ------------------------------------------------------------------ updater
+
+Say 'Installing the daily updater'
+Register-UpdateTask
 
 # ------------------------------------------------------------------- verify
 

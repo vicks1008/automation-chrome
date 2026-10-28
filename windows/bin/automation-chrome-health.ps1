@@ -21,4 +21,16 @@ try {
   Write-Output 'guard  (9333): DOWN or upstream error'
   $rc = 1
 }
+# Tab hygiene: many open pages usually means sessions are leaking tabs.
+# Informational only; nothing is closed automatically.
+try {
+  $pages = @(Invoke-RestMethod -Uri 'http://127.0.0.1:9333/json/list' -TimeoutSec 3 -UseBasicParsing | Where-Object { $_.type -eq 'page' }).Count
+  if ($pages -gt 15) {
+    Write-Output "tabs         : $pages open (more than 15; sessions may be leaking tabs, close the ones you own by pageId)"
+  } else {
+    Write-Output "tabs         : $pages open"
+  }
+  $h = Invoke-RestMethod -Uri 'http://127.0.0.1:9333/focus-guard/health' -TimeoutSec 3 -UseBasicParsing
+  if ($null -ne $h.idleSeconds) { Write-Output "agent idle   : $($h.idleSeconds)s since last command" }
+} catch { }
 exit $rc
