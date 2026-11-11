@@ -125,7 +125,9 @@ if command -v claude >/dev/null 2>&1; then
   if claude mcp list 2>/dev/null | grep -q chrome-devtools; then
     pass "registered with Claude Code"
   else
-    fail "not registered with Claude Code (claude mcp list)"
+    # Optional: only people who use Claude Code need this. Cursor-only setups
+    # (install.sh --no-claude) must not fail verification because a claude CLI exists.
+    info "not registered with Claude Code (optional; skip unless you use Claude Code)"
   fi
 fi
 if [[ -f "$HOME/.cursor/mcp.json" ]]; then
