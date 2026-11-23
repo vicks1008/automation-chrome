@@ -59,6 +59,19 @@ say()  { printf '\033[1;36m==>\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33m[warn]\033[0m %s\n' "$*"; }
 die()  { printf '\033[1;31m[fail]\033[0m %s\n' "$*" >&2; exit 1; }
 
+# boxed <ansi-color> <line>...  Colored ASCII box for moments a person must not
+# touch the browser. Lines must be ASCII so the right edge lines up.
+boxed() {
+  local color="$1" width=0 line bar; shift
+  for line in "$@"; do
+    if (( ${#line} > width )); then width=${#line}; fi
+  done
+  bar="$(printf '%*s' $((width + 4)) '' | tr ' ' '=')"
+  printf '\n\033[1;%sm%s\n' "$color" "$bar"
+  for line in "$@"; do printf '| %-*s |\n' "$width" "$line"; done
+  printf '%s\033[0m\n\n' "$bar"
+}
+
 # Reload a launchd job from a (possibly changed) plist, idempotently. bootout is
 # asynchronous: bootstrapping again before the label has fully unloaded fails
 # with "Input/output error" (errno 5). So wait for the label to disappear first.
@@ -231,6 +244,15 @@ echo "    $GUARD_LABEL.plist"
 # Boot order matters: Chrome must own 9335 before the guard binds 9333 and
 # proxies to it. Bring up Chrome first, wait for it, then the guard.
 say "Starting Chrome (internal port $CHROME_PORT) via launchd"
+boxed 33 \
+  "A CHROME WINDOW IS ABOUT TO OPEN: HANDS OFF" \
+  "" \
+  "This is the separate automation Chrome (profile CursorAutomation)." \
+  "Do NOT click, type in, or close it while this script runs." \
+  "" \
+  "If Chrome offers to sign in to Chrome or turn on sync, choose" \
+  "'Use Chrome without an account' (or 'No thanks'). Do NOT sync" \
+  "your Google profile into this browser."
 reload_job "$CHROME_LABEL" "$CHROME_PLIST"
 for _ in $(seq 1 40); do
   sleep 0.5

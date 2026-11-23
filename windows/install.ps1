@@ -42,6 +42,18 @@ function Info([string]$m) { Write-Host "    $m" }
 function Warn([string]$m) { Write-Host "[warn] $m" -ForegroundColor Yellow }
 function Die([string]$m)  { Write-Host "[fail] $m" -ForegroundColor Red; exit 1 }
 
+# Colored ASCII box for moments a person must not touch the browser.
+function Boxed([string]$color, [string[]]$lines) {
+  $width = 0
+  foreach ($l in $lines) { if ($l.Length -gt $width) { $width = $l.Length } }
+  $bar = '=' * ($width + 4)
+  Write-Host ''
+  Write-Host $bar -ForegroundColor $color
+  foreach ($l in $lines) { Write-Host ('| ' + $l.PadRight($width) + ' |') -ForegroundColor $color }
+  Write-Host $bar -ForegroundColor $color
+  Write-Host ''
+}
+
 function Test-Http([string]$url) {
   try { $null = Invoke-RestMethod -Uri $url -TimeoutSec 2 -UseBasicParsing; return $true } catch { return $false }
 }
@@ -252,6 +264,16 @@ function Start-Role([string]$taskName, [string]$role) {
 
 # Boot order matters: Chrome must own 9335 before the guard binds 9333.
 Say "Starting Chrome (internal port $ChromePort)"
+Boxed 'Yellow' @(
+  'A CHROME WINDOW IS ABOUT TO OPEN: HANDS OFF',
+  '',
+  'This is the separate automation Chrome (profile CursorAutomation).',
+  'Do NOT click, type in, or close it while this script runs.',
+  '',
+  'If Chrome offers to sign in to Chrome or turn on sync, choose',
+  "'Use Chrome without an account' (or 'No thanks'). Do NOT sync",
+  'your Google profile into this browser.'
+)
 Start-Role 'Chrome' 'chrome'
 if (-not (Wait-Http "http://127.0.0.1:$ChromePort/json/version" 30)) {
   Die "Chrome never came up on $ChromePort. Check $Runtime\supervise-chrome.log"
