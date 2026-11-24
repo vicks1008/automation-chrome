@@ -13,7 +13,7 @@ import {
   missingFlags,
   normalizeFlag,
   pullRepo,
-  sharedChanges,
+  syncSharedSkills,
 } from './update.mjs';
 
 const tmp = (p) => fs.mkdtempSync(path.join(os.tmpdir(), `${p}-`));
@@ -78,6 +78,7 @@ function makeRepoPair() {
   git(work, 'config', 'user.email', 't@t');
   git(work, 'config', 'user.name', 't');
   fs.writeFileSync(path.join(work, 'a.txt'), '1');
+  fs.writeFileSync(path.join(work, 'b.txt'), 'b');
   git(work, 'add', '.');
   git(work, 'commit', '-qm', 'one');
   git(work, 'push', '-q', 'origin', 'HEAD');
@@ -99,7 +100,16 @@ test('pullRepo fast-forwards a clean checkout and reports the changed files', ()
   assert.equal(pullRepo(work).status, 'current');
 });
 
-test('pullRepo leaves a dirty checkout alone', () => {
+test('pullRepo fast-forwards past uncommitted edits to unrelated files', () => {
+  const { work } = makeRepoPair();
+  fs.writeFileSync(path.join(work, 'b.txt'), 'another session is editing this');
+  const r = pullRepo(work);
+  assert.equal(r.status, 'pulled');
+  assert.equal(fs.readFileSync(path.join(work, 'a.txt'), 'utf8'), '2');
+  assert.equal(fs.readFileSync(path.join(work, 'b.txt'), 'utf8'), 'another session is editing this');
+});
+
+test('pullRepo leaves a checkout alone when the incoming commits touch an edited file', () => {
   const { work } = makeRepoPair();
   fs.writeFileSync(path.join(work, 'a.txt'), 'local edit');
   assert.equal(pullRepo(work).status, 'dirty');
@@ -113,27 +123,32 @@ test('pullRepo --dry-run changes nothing, and a missing checkout is reported', (
   assert.equal(pullRepo(path.join(os.tmpdir(), 'no-such-repo-xyz')).status, 'missing');
 });
 
-test('shared skills: notify on a changed repo copy, never write to local copies', () => {
-  const root = tmp('upd-skills');
-  const repo = path.join(root, 'repo', 'skills', 's');
-  const local = path.join(root, 'home', 's');
-  fs.mkdirSync(repo, { recursive: true });
-  fs.mkdirSync(local, { recursive: true });
-  fs.writeFileSync(path.join(repo, 'SKILL.md'), 'v1');
-  fs.writeFileSync(path.join(local, 'SKILL.md'), 'v1 plus a local lesson');
-  const entries = [{ name: 'skill:s', repoPath: repo, localPaths: [local, path.join(root, 'absent')] }];
+test('shared skills: runs the repo sync script and reports its result', () => {
+  const razzDir = tmp('upd-razz');
+  const ctx = { razzDir, bundleDir: '/bundle' };
+  // A checkout that predates the script is skipped, not an error.
+  assert.equal(syncSharedSkills(ctx).status, 'no-script');
 
-  // Seed: nothing is reported the first time (no previous hashes).
-  const first = sharedChanges(entries, undefined);
-  assert.deepEqual(first.names, []);
-  // Unchanged repo copy: no notice, even though the local copy differs.
-  assert.deepEqual(sharedChanges(entries, first.seen).names, []);
-  // Repo copy changes: notice.
-  fs.writeFileSync(path.join(repo, 'SKILL.md'), 'v2');
-  const second = sharedChanges(entries, first.seen);
-  assert.deepEqual(second.names, ['skill:s']);
-  // Local copy is untouched.
-  assert.equal(fs.readFileSync(path.join(local, 'SKILL.md'), 'utf8'), 'v1 plus a local lesson');
-  // A skill that is not installed locally is skipped.
-  assert.deepEqual(sharedChanges([{ ...entries[0], localPaths: [path.join(root, 'absent')] }], first.seen).names, []);
+  fs.mkdirSync(path.join(razzDir, 'scripts'));
+  fs.writeFileSync(path.join(razzDir, 'scripts', 'sync-skills.mjs'), '');
+  const calls = [];
+  const exec = (cmd, args, opts) => {
+    calls.push({ cmd, args, opts });
+    return { ok: true, status: 0, stdout: `noise\n${JSON.stringify({ installed: 1, updated: 2, diverged: 0, ok: 3, backups: [] })}\n`, stderr: '' };
+  };
+  const r = syncSharedSkills(ctx, exec);
+  assert.equal(r.status, 'ok');
+  assert.equal(r.result.updated, 2);
+  assert.deepEqual(calls[0].args.slice(1), ['--json']);
+  assert.equal(calls[0].opts.env.AUTOMATION_CHROME_BUNDLE_DIR, '/bundle');
+
+  // Dry run asks for --check, and a non-zero exit (drift found) still parses.
+  const drift = () => ({ ok: false, status: 1, stdout: JSON.stringify({ differs: [{ name: 's' }], backups: [] }), stderr: '' });
+  const d = syncSharedSkills(ctx, drift, { dryRun: true });
+  assert.equal(d.status, 'ok');
+  assert.equal(d.result.differs.length, 1);
+
+  // Unparseable output is a failure with detail, never a crash.
+  const bad = () => ({ ok: false, status: 2, stdout: '', stderr: 'boom' });
+  assert.equal(syncSharedSkills(ctx, bad).status, 'failed');
 });

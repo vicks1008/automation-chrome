@@ -18,8 +18,10 @@
  *      A failure rolls back and is remembered so it is not retried daily.
  *   5. Restart Chrome onto a newer on-disk build, only when no agent has sent a
  *      command for MIN_IDLE_SECONDS.
- *   6. Tell the user when shared skills/rules changed in the repos. Local copies
- *      are never overwritten (they hold lessons learned on this machine).
+ *   6. Mirror the shared skills and rules from the repos into ~/.cursor and
+ *      ~/.claude (Razz-Auditor's scripts/sync-skills.mjs), so everyone runs the
+ *      same set. An installed copy with edits that are not in the repo is saved
+ *      under ~/.myrazz/skill-backups/ first, and the user is told to merge it.
  *   7. Notify only when a person needs to act.
  *
  * Usage: node update.mjs [--dry-run] [--force] [--min-idle <seconds>]
@@ -28,7 +30,6 @@
  */
 
 import { spawnSync } from 'node:child_process';
-import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -112,40 +113,28 @@ export function idleDecision({ running, installed, idleSeconds, minIdle = MIN_ID
   return idleSeconds >= minIdle ? 'restart' : 'wait';
 }
 
-export function hashPath(p) {
-  const h = crypto.createHash('sha1');
-  const walk = (cur, rel) => {
-    const st = fs.statSync(cur);
-    if (st.isDirectory()) {
-      for (const name of fs.readdirSync(cur).sort()) walk(path.join(cur, name), path.posix.join(rel, name));
-    } else {
-      h.update(rel);
-      h.update('\0');
-      h.update(fs.readFileSync(cur));
-      h.update('\0');
-    }
-  };
-  walk(p, '');
-  return h.digest('hex');
-}
-
 /**
- * Shared skills/rules whose repo copy changed since we last looked AND differs
- * from the local copy. Pure: reads files, writes nothing. Entries whose local
- * copy is absent are skipped (not installed there). `lastSeen` is name -> hash.
+ * Mirror the shared skills and rules from the repos into the editors' folders by
+ * running Razz-Auditor's scripts/sync-skills.mjs (the single implementation, also
+ * used by setup). Returns { status, result } where status is 'no-script' (the
+ * checkout predates the script), 'failed', or 'ok'.
  */
-export function sharedChanges(entries, lastSeen) {
-  const names = [];
-  const seen = {};
-  for (const e of entries) {
-    if (!fs.existsSync(e.repoPath)) continue;
-    const local = e.localPaths.find((p) => fs.existsSync(p));
-    if (!local) continue;
-    const repoHash = hashPath(e.repoPath);
-    seen[e.name] = repoHash;
-    if (lastSeen && lastSeen[e.name] !== repoHash && hashPath(local) !== repoHash) names.push(e.name);
+export function syncSharedSkills(ctx, exec = defaultExec, { dryRun = false } = {}) {
+  const script = path.join(ctx.razzDir, 'scripts', 'sync-skills.mjs');
+  if (!fs.existsSync(script)) return { status: 'no-script' };
+  const args = [script, '--json', ...(dryRun ? ['--check'] : [])];
+  const r = exec(process.execPath, args, {
+    cwd: ctx.razzDir,
+    timeout: 60_000,
+    env: { AUTOMATION_CHROME_BUNDLE_DIR: ctx.bundleDir },
+  });
+  // --check exits 1 when something differs; the JSON on stdout is still valid.
+  const line = r.stdout.trim().split('\n').filter(Boolean).pop();
+  try {
+    return { status: 'ok', result: JSON.parse(line) };
+  } catch {
+    return { status: 'failed', detail: (r.stderr || r.stdout).trim().slice(-200) };
   }
-  return { names, seen };
 }
 
 export function defaultExec(cmd, args, opts = {}) {
@@ -174,11 +163,17 @@ export function pullRepo(dir, exec = defaultExec, { dryRun = false } = {}) {
   if (!counts.ok) return { status: 'no-upstream' };
   const [ahead, behind] = counts.stdout.trim().split(/\s+/).map(Number);
   if (!behind) return { status: 'current' };
-  const dirty = git('status', '--porcelain', '--untracked-files=no').stdout.trim();
-  if (dirty) return { status: 'dirty', behind };
   if (ahead) return { status: 'diverged', ahead, behind };
-  if (dryRun) return { status: 'would-pull', behind };
   const files = git('diff', '--name-only', 'HEAD', '@{u}').stdout.split('\n').filter(Boolean);
+  // Uncommitted edits only block the pull when the incoming commits touch the
+  // same files; otherwise (other sessions' scratch files) a fast-forward is safe,
+  // and a stuck checkout would stop every shared skill from reaching this machine.
+  const dirtyFiles = git('status', '--porcelain', '--untracked-files=no')
+    .stdout.split('\n')
+    .filter(Boolean)
+    .map((l) => l.slice(3).split(' -> ').pop());
+  if (dirtyFiles.some((f) => files.includes(f))) return { status: 'dirty', behind };
+  if (dryRun) return { status: 'would-pull', behind };
   const merged = git('merge', '--ff-only', '@{u}');
   if (!merged.ok) return { status: 'merge-failed', detail: merged.stderr.trim() };
   return { status: 'pulled', behind, files };
@@ -430,12 +425,20 @@ export async function run(options = {}, ctx = defaultContext(), exec = defaultEx
       }
     }
 
-    // 6. Shared skills and rules: tell, never overwrite.
-    const entries = sharedEntries(ctx);
-    const { names, seen } = sharedChanges(entries, state.sharedSeen);
-    if (names.length) notes.push(`Shared skills/rules changed in the repo: ${names.join(', ')}. Ask your agent to merge them into your local copies.`);
-    log(`shared skills/rules changed: ${names.length ? names.join(', ') : 'none'}`);
-    if (!dryRun) state.sharedSeen = { ...(state.sharedSeen ?? {}), ...seen };
+    // 6. Shared skills and rules: mirror the repos into this machine's folders.
+    const synced = syncSharedSkills(ctx, exec, { dryRun });
+    if (synced.status === 'ok') {
+      const r = synced.result;
+      log(`shared skills/rules: ${r.installed} installed, ${r.updated} updated, ${r.diverged} replaced after backup, ${r.ok} current${dryRun ? ' (dry run: nothing written)' : ''}`);
+      if (r.backups?.length) {
+        notes.push(`Skills replaced with the shared repo copies: ${r.backups.map((b) => b.name).join(', ')}. Your local edits were saved in ~/.myrazz/skill-backups; ask your agent to merge anything worth keeping into the repo copy and push it.`);
+      }
+    } else if (synced.status === 'failed') {
+      log(`shared skills/rules sync FAILED: ${synced.detail}`);
+      notes.push('Syncing shared skills failed; see the update log, then run node scripts/sync-skills.mjs in Razz-Auditor.');
+    } else {
+      log('shared skills/rules: Razz-Auditor has no sync-skills.mjs yet (checkout not updated)');
+    }
 
     // 7. Health check; the full verify only when something changed.
     const after = await getJson(`${ctx.guardUrl}/focus-guard/health`);
@@ -465,27 +468,6 @@ export async function run(options = {}, ctx = defaultContext(), exec = defaultEx
     if (!dryRun) fs.rmSync(ctx.lockFile, { force: true });
     flush();
   }
-}
-
-function sharedEntries(ctx) {
-  const home = ctx.home;
-  const out = [];
-  const skillRoots = [path.join(home, '.cursor', 'skills'), path.join(home, '.claude', 'skills')];
-  for (const repo of [ctx.bundleDir, ctx.razzDir]) {
-    const skillsDir = path.join(repo, 'skills');
-    if (fs.existsSync(skillsDir)) {
-      for (const name of fs.readdirSync(skillsDir)) {
-        out.push({ name: `skill:${name}`, repoPath: path.join(skillsDir, name), localPaths: skillRoots.map((r) => path.join(r, name)) });
-      }
-    }
-  }
-  const rulesDir = path.join(ctx.razzDir, 'cursor-rules');
-  if (fs.existsSync(rulesDir)) {
-    for (const file of fs.readdirSync(rulesDir).filter((f) => f.endsWith('.mdc'))) {
-      out.push({ name: `rule:${file}`, repoPath: path.join(rulesDir, file), localPaths: [path.join(home, '.cursor', 'rules', file)] });
-    }
-  }
-  return out;
 }
 
 /** Install into the runtime dir, probe, and roll back on any failure. */
